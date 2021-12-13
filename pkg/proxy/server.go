@@ -410,6 +410,7 @@ func (s *Server) GetFilterParser() ParseEngine {
 		shellParser := Parser{
 			id:             s.ID,
 			protocolType:   s.connOpts.ProtocolType,
+			platform:       s.platform,
 			jmsService:     s.jmsService,
 			cmdFilterRules: s.filterRules,
 			permAction:     s.permActions,

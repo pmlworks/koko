@@ -48,6 +48,7 @@ type Parser struct {
 	id           string
 	protocolType string
 	jmsService   *service.JMService
+	platform     *model.Platform
 
 	userOutputChan chan []byte
 	srvOutputChan  chan []byte
@@ -244,7 +245,7 @@ func (p *Parser) parseInputState(b []byte) []byte {
 				default:
 					// 默认是取消 不执行
 					p.srvOutputChan <- []byte("\r\n")
-					p.userOutputChan <- breakInputPacket(p.protocolType)
+					p.userOutputChan <- breakInputPacket(p.protocolType, p.platform)
 				}
 				// 审核结束, 重置状态
 				p.confirmStatus.SetStatus(StatusNone)
@@ -252,7 +253,7 @@ func (p *Parser) parseInputState(b []byte) []byte {
 		case "n":
 			p.confirmStatus.SetStatus(StatusNone)
 			p.srvOutputChan <- []byte("\r\n")
-			return breakInputPacket(p.protocolType)
+			return breakInputPacket(p.protocolType, p.platform)
 		default:
 			p.srvOutputChan <- []byte("\r\n" + waitMsg)
 		}
@@ -315,7 +316,7 @@ func (p *Parser) forbiddenCommand(cmd string) {
 		User:        p.currentActiveUser}
 	p.command = ""
 	p.output = ""
-	p.userOutputChan <- breakInputPacket(p.protocolType)
+	p.userOutputChan <- breakInputPacket(p.protocolType, p.platform)
 }
 
 // parseCmdInput 解析命令的输入
@@ -599,11 +600,18 @@ func matchMark(p []byte, marks [][]byte) bool {
 	return false
 }
 
-func breakInputPacket(protocolType string) []byte {
+func breakInputPacket(protocolType string, platform *model.Platform) []byte {
 	switch protocolType {
 	case model.ProtocolTelnet:
 		return []byte{tclientlib.IAC, tclientlib.BRK, '\r'}
 	case model.ProtocolSSH:
+		if platform != nil {
+			name := strings.ToLower(platform.Name)
+			os := strings.ToLower(platform.BaseOs)
+			if strings.Contains(name, h3c) || strings.Contains(os, h3c) {
+				return []byte{CharCTRLE, CharCTRLX, '\r'}
+			}
+		}
 		return []byte{CharCTRLE, utils.CharCleanLine, '\r'}
 	}
 	return []byte{utils.CharCleanLine, CharCTRLC, '\r'}
@@ -619,9 +627,15 @@ const (
 	CharCleanRightLine = '\x0B'
 	CharCTRLC          = '\x03'
 	CharCTRLE          = '\x05'
+	CharCTRLX          = '\x18'
 )
 
 const (
 	zmodemStartEvent = "ZMODEM_START"
 	zmodemEndEvent   = "ZMODEM_END"
 )
+
+const (
+	h3c = "h3c"
+)
+
