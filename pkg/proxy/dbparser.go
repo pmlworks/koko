@@ -19,8 +19,6 @@ const (
 	DBOutputParserName = "DB Output parser"
 )
 
-var _ ParseEngine = (*DBParser)(nil)
-
 type DBParser struct {
 	id string
 

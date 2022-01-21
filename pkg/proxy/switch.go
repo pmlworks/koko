@@ -180,19 +180,14 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 		Body:  nil,
 		Meta:  meta,
 	})
-	parser.RegisterEventCallback(zmodemStartEvent, func() {
-		room.Broadcast(&exchange.RoomMessage{
-			Event: exchange.ActionEvent,
-			Body:  []byte(zmodemStartEvent),
-		})
-	})
-
-	parser.RegisterEventCallback(zmodemEndEvent, func() {
-		room.Broadcast(&exchange.RoomMessage{
-			Event: exchange.ActionEvent,
-			Body:  []byte(zmodemEndEvent),
-		})
-	})
+	if parser.zmodemParser != nil {
+		parser.zmodemParser.fireStatusEvent = func(event string) {
+			room.Broadcast(&exchange.RoomMessage{
+				Event: exchange.ActionEvent,
+				Body:  []byte(event),
+			})
+		}
+	}
 	go func() {
 		for {
 			buf := make([]byte, 1024)

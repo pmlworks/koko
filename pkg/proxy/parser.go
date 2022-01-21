@@ -17,6 +17,7 @@ import (
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/jumpserver/koko/pkg/utils"
+	"github.com/jumpserver/koko/pkg/zmodem"
 )
 
 var (
@@ -41,8 +42,6 @@ const (
 	CommandInputParserName  = "Command Input parser"
 	CommandOutputParserName = "Command Output parser"
 )
-
-var _ ParseEngine = (*Parser)(nil)
 
 type Parser struct {
 	id           string
@@ -72,8 +71,7 @@ type Parser struct {
 
 	confirmStatus commandConfirmStatus
 
-	zmodemParser        *ZmodemParser
-	permAction          *model.Permission
+	zmodemParser        *zmodem.ZmodemParser
 	enableDownload      bool
 	enableUpload        bool
 	abortedFileTransfer bool
@@ -614,7 +612,7 @@ func breakInputPacket(protocolType string) []byte {
 	case model.ProtocolK8S:
 		return []byte{CharCTRLE, utils.CharCleanLine, '\r'}
 	}
-	return []byte{utils.CharCleanLine, CharCTRLC, '\r'}
+	return []byte{CharCTRLE, utils.CharCleanLine, '\r'}
 }
 
 /*

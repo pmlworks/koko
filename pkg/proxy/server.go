@@ -458,48 +458,34 @@ func (s *Server) ZmodemFileTransferEvent(zinfo *ZFileInfo, status bool) {
 	}
 }
 
-func (s *Server) GetFilterParser() ParseEngine {
-	switch s.connOpts.ProtocolType {
-	case srvconn.ProtocolSSH,
-		srvconn.ProtocolTELNET, srvconn.ProtocolK8s:
-		var (
-			enableUpload   bool
-			enableDownload bool
-		)
-		if s.permActions != nil {
-			if s.permActions.EnableDownload() {
-				enableDownload = true
-			}
-			if s.permActions.EnableUpload() {
-				enableUpload = true
-			}
+func (s *Server) GetFilterParser() *Parser {
+	var (
+		enableUpload   bool
+		enableDownload bool
+	)
+	if s.permActions != nil {
+		if s.permActions.EnableDownload() {
+			enableDownload = true
 		}
-		var zParser ZmodemParser
-		zParser.setStatus(ZParserStatusNone)
-		zParser.fileEventCallback = s.ZmodemFileTransferEvent
-		shellParser := Parser{
-			id:             s.ID,
-			protocolType:   s.connOpts.ProtocolType,
-			jmsService:     s.jmsService,
-			cmdFilterRules: s.filterRules,
-			permAction:     s.permActions,
-			enableDownload: enableDownload,
-			enableUpload:   enableUpload,
-			zmodemParser:   &zParser,
-			i18nLang:       s.connOpts.i18nLang,
+		if s.permActions.EnableUpload() {
+			enableUpload = true
 		}
-		shellParser.initial()
-		return &shellParser
-	case srvconn.ProtocolMySQL, srvconn.ProtocolMariadb, srvconn.ProtocolSQLServer, srvconn.ProtocolRedis:
-		dbParser := DBParser{
-			id:             s.ID,
-			cmdFilterRules: s.filterRules,
-			i18nLang:       s.connOpts.i18nLang,
-		}
-		dbParser.initial()
-		return &dbParser
 	}
-	return nil
+	var zParser ZmodemParser
+	zParser.setStatus(ZParserStatusNone)
+	zParser.fileEventCallback = s.ZmodemFileTransferEvent
+	parser := Parser{
+		id:             s.ID,
+		protocolType:   s.connOpts.ProtocolType,
+		jmsService:     s.jmsService,
+		cmdFilterRules: s.filterRules,
+		enableDownload: enableDownload,
+		enableUpload:   enableUpload,
+		zmodemParser:   &zParser,
+		i18nLang:       s.connOpts.i18nLang,
+	}
+	parser.initial()
+	return &parser
 }
 
 func (s *Server) GetReplayRecorder() *ReplyRecorder {
