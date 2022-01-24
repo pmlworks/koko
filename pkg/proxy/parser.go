@@ -91,7 +91,7 @@ func (p *Parser) initial() {
 	p.closed = make(chan struct{})
 	p.cmdRecordChan = make(chan *ExecutedCommand, 1024)
 	p.eventsFuncMap = make(map[string]func())
-	p.zmodemParser.fireStatusEvent = func(event string) {
+	p.zmodemParser.FireStatusEvent = func(event string) {
 		if callback, ok := p.eventsFuncMap[event]; ok {
 			callback()
 		}
@@ -159,15 +159,15 @@ func (p *Parser) parseInputState(b []byte) []byte {
 	lang := i18n.NewLang(p.i18nLang)
 	if p.zmodemParser.IsStartSession() {
 		switch p.zmodemParser.Status() {
-		case ZParserStatusReceive:
+		case zmodem.ZParserStatusReceive:
 			p.zmodemParser.Parse(b)
 			if p.zmodemParser.IsZFilePacket() && !p.enableUpload {
 				logger.Infof("Send zmodem user skip and srv abort to disable upload")
 				p.abortedFileTransfer = true
 				// 不记录中断的文件
-				p.zmodemParser.setAbortMark()
-				p.srvOutputChan <- skipSequence
-				return AbortSession
+				p.zmodemParser.SetAbortMark()
+				p.srvOutputChan <- zmodem.SkipSequence
+				return zmodem.AbortSession
 			}
 
 			if !p.zmodemParser.IsStartSession() && p.abortedFileTransfer {
@@ -179,19 +179,19 @@ func (p *Parser) parseInputState(b []byte) []byte {
 				logger.Info("Zmodem abort upload file finished")
 				msg := lang.T("have no permission to upload file")
 				p.abortedFileTransfer = false
-				p.srvOutputChan <- CancelSequence
+				p.srvOutputChan <- zmodem.CancelSequence
 				p.srvOutputChan <- []byte("\r\n")
 				p.srvOutputChan <- []byte(msg)
 				p.srvOutputChan <- []byte("\r\n")
 				return charEnter
 			}
-		case ZParserStatusSend:
+		case zmodem.ZParserStatusSend:
 			if p.zmodemParser.IsZFilePacket() && !p.enableDownload {
 				logger.Infof("Send zmodem srv skip and user abort to disable download")
 				p.abortedFileTransfer = true
-				p.userOutputChan <- AbortSession
+				p.userOutputChan <- zmodem.AbortSession
 				// 不记录中断的文件
-				p.zmodemParser.setAbortMark()
+				p.zmodemParser.SetAbortMark()
 				return charEnter
 			}
 		default:
@@ -367,7 +367,7 @@ func (p *Parser) parseVimState(b []byte) {
 func (p *Parser) splitCmdStream(b []byte) []byte {
 	lang := i18n.NewLang(p.i18nLang)
 	if p.zmodemParser.IsStartSession() {
-		if p.zmodemParser.Status() == ZParserStatusSend {
+		if p.zmodemParser.Status() == zmodem.ZParserStatusSend {
 			p.zmodemParser.Parse(b)
 		}
 		if !p.zmodemParser.IsStartSession() && p.abortedFileTransfer {

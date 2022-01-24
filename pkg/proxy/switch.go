@@ -181,7 +181,7 @@ func (s *SwitchSession) Bridge(userConn UserConnection, srvConn srvconn.ServerCo
 		Meta:  meta,
 	})
 	if parser.zmodemParser != nil {
-		parser.zmodemParser.fireStatusEvent = func(event string) {
+		parser.zmodemParser.FireStatusEvent = func(event string) {
 			room.Broadcast(&exchange.RoomMessage{
 				Event: exchange.ActionEvent,
 				Body:  []byte(event),
