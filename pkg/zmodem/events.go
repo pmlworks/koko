@@ -1,7 +1,9 @@
 package zmodem
 
-const (
-	zmodemStartEvent = "ZMODEM_START"
+type StatusEvent string
 
-	zmodemEndEvent = "ZMODEM_END"
+const (
+	StartEvent StatusEvent = "ZMODEM_START"
+
+	EndEvent StatusEvent = "ZMODEM_END"
 )

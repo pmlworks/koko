@@ -77,8 +77,6 @@ type Parser struct {
 	abortedFileTransfer bool
 	currentActiveUser   CurrentActiveUser
 
-	eventsFuncMap map[string]func()
-
 	i18nLang string
 }
 
@@ -90,12 +88,6 @@ func (p *Parser) initial() {
 	p.cmdOutputParser = NewCmdParser(p.id, CommandOutputParserName)
 	p.closed = make(chan struct{})
 	p.cmdRecordChan = make(chan *ExecutedCommand, 1024)
-	p.eventsFuncMap = make(map[string]func())
-	p.zmodemParser.FireStatusEvent = func(event string) {
-		if callback, ok := p.eventsFuncMap[event]; ok {
-			callback()
-		}
-	}
 }
 
 // ParseStream 解析数据流
@@ -568,10 +560,6 @@ func (p *Parser) UpdateActiveUser(msg *exchange.RoomMessage) {
 	p.currentActiveUser.User = msg.Meta.User
 }
 
-func (p *Parser) RegisterEventCallback(event string, f func()) {
-	p.eventsFuncMap[event] = f
-}
-
 type ExecutedCommand struct {
 	Command     string
 	Output      string
@@ -625,9 +613,4 @@ const (
 	CharCleanRightLine = '\x0B'
 	CharCTRLC          = '\x03'
 	CharCTRLE          = '\x05'
-)
-
-const (
-	zmodemStartEvent = "ZMODEM_START"
-	zmodemEndEvent   = "ZMODEM_END"
 )

@@ -36,7 +36,7 @@ type ZmodemParser struct {
 	abortMark       bool // 不记录中断的文件
 	hasDataTransfer bool
 
-	FireStatusEvent func(event string)
+	FireStatusEvent func(event StatusEvent)
 }
 
 // rz sz 解析的入口
@@ -64,7 +64,7 @@ func (z *ZmodemParser) Parse(p []byte) {
 			logger.Infof("Zmodem session %s end", z.Status())
 			z.setStatus(ZParserStatusNone)
 			if z.FireStatusEvent != nil {
-				z.FireStatusEvent(zmodemEndEvent)
+				z.FireStatusEvent(EndEvent)
 			}
 		}
 		return
@@ -87,7 +87,7 @@ func (z *ZmodemParser) Parse(p []byte) {
 			endCallback: func() {
 				z.setStatus(ZParserStatusNone)
 				if z.FireStatusEvent != nil {
-					z.FireStatusEvent(zmodemEndEvent)
+					z.FireStatusEvent(EndEvent)
 				}
 			},
 			ZFileHeaderCallback: z.zFileFrameCallback,
@@ -95,7 +95,7 @@ func (z *ZmodemParser) Parse(p []byte) {
 		}
 		z.setStatus(ZParserStatusSend)
 		if z.FireStatusEvent != nil {
-			z.FireStatusEvent(zmodemStartEvent)
+			z.FireStatusEvent(StartEvent)
 		}
 		z.currentSession.consume(remain)
 	case ZRINIT:
@@ -104,7 +104,7 @@ func (z *ZmodemParser) Parse(p []byte) {
 			endCallback: func() {
 				z.setStatus(ZParserStatusNone)
 				if z.FireStatusEvent != nil {
-					z.FireStatusEvent(zmodemEndEvent)
+					z.FireStatusEvent(EndEvent)
 				}
 			},
 			ZFileHeaderCallback: z.zFileFrameCallback,
@@ -112,7 +112,7 @@ func (z *ZmodemParser) Parse(p []byte) {
 		}
 		z.setStatus(ZParserStatusReceive)
 		if z.FireStatusEvent != nil {
-			z.FireStatusEvent(zmodemStartEvent)
+			z.FireStatusEvent(StartEvent)
 		}
 		z.currentSession.consume(remain)
 	default:
