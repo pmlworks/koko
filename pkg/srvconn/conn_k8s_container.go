@@ -217,7 +217,7 @@ func HasShellInContainer(opt *ContainerOptions, shell string) error {
 	if err != nil {
 		return err
 	}
-	command := []string{"which", shell}
+	command := []string{"command", "-v", shell}
 	validateChecker := func(result string) error {
 		if !strings.HasSuffix(result, shell) {
 			return fmt.Errorf("%w: %s %s", ErrNotFoundCommand, result, shell)
