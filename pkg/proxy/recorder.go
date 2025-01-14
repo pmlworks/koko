@@ -145,6 +145,10 @@ func NewReplayRecord(sid string, jmsService *service.JMService,
 	fd, err := os.Create(recorder.absFilePath)
 	if err != nil {
 		logger.Errorf("Create replay file %s error: %s\n", recorder.absFilePath, err)
+		reason := model.SessionReplayErrCreatedFailed
+		if err1 := jmsService.SessionReplayFailed(sid, reason); err1 != nil {
+			logger.Errorf("Session[%s] update replay status %s failed: %s", sid, reason, err1)
+		}
 		recorder.err = err
 		return recorder, err
 	}
@@ -197,6 +201,7 @@ func (r *ReplyRecorder) Record(p []byte) {
 
 func (r *ReplyRecorder) End() {
 	if r.isNullStorage() {
+		r.recordLifecycleLog(model.ReplayUploadFailure, string(model.ReasonErrNullStorage))
 		return
 	}
 	_ = r.file.Close()
@@ -226,8 +231,10 @@ func (r *ReplyRecorder) uploadReplay() {
 func (r *ReplyRecorder) UploadGzipFile(maxRetry int) {
 	if r.isNullStorage() {
 		_ = os.Remove(r.absGzipFilePath)
+		r.recordLifecycleLog(model.ReplayUploadFailure, string(model.ReasonErrNullStorage))
 		return
 	}
+	r.recordLifecycleLog(model.ReplayUploadStart, "")
 	for i := 0; i <= maxRetry; i++ {
 		logger.Infof("Upload replay file: %s, type: %s", r.absGzipFilePath, r.storage.TypeName())
 		err := r.storage.Upload(r.absGzipFilePath, r.Target)
@@ -236,12 +243,19 @@ func (r *ReplyRecorder) UploadGzipFile(maxRetry int) {
 			if err = r.jmsService.FinishReply(r.SessionID); err != nil {
 				logger.Errorf("Session[%s] finish replay err: %s", r.SessionID, err)
 			}
+			r.recordLifecycleLog(model.ReplayUploadSuccess, "")
 			break
 		}
+		failureMsg := strings.ReplaceAll(err.Error(), ",", " ")
+		r.recordLifecycleLog(model.ReplayUploadFailure, failureMsg)
 		logger.Errorf("Upload replay file err: %s", err)
 		// 如果还是失败，上传 server 再传一次
 		if i == maxRetry {
 			if r.storage.TypeName() == "server" {
+				reason := model.SessionReplayErrUploadFailed
+				if err1 := r.jmsService.SessionReplayFailed(r.SessionID, reason); err1 != nil {
+					logger.Errorf("Session[%s] update replay status %s failed: %s", r.SessionID, reason, err1)
+				}
 				break
 			}
 			logger.Errorf("Session[%s] using server storage retry upload", r.SessionID)
@@ -249,6 +263,13 @@ func (r *ReplyRecorder) UploadGzipFile(maxRetry int) {
 			r.UploadGzipFile(3)
 			break
 		}
+	}
+}
+
+func (r *ReplyRecorder) recordLifecycleLog(event model.LifecycleEvent, reason string) {
+	eventLog := model.SessionLifecycleLog{Reason: reason}
+	if err := r.jmsService.RecordSessionLifecycleLog(r.SessionID, event, eventLog); err != nil {
+		logger.Errorf("Update session %s activity log %s failed: %s", r.SessionID, event, err)
 	}
 }
 
@@ -304,6 +325,8 @@ func (r *FTPFileRecorder) setFTPFile(id string, info *FTPFileInfo) {
 func (r *FTPFileRecorder) CreateFTPFileInfo(logData *model.FTPLog) (info *FTPFileInfo, err error) {
 	info = &FTPFileInfo{
 		ftpLog: logData,
+
+		maxWrittenSize: r.MaxFileSize,
 	}
 	today := info.ftpLog.DateStart.UTC().Format(dateTimeFormat)
 	ftpFileRootDir := config.GetConf().FTPFileFolderPath
@@ -317,7 +340,7 @@ func (r *FTPFileRecorder) CreateFTPFileInfo(logData *model.FTPLog) (info *FTPFil
 	storageTargetName := strings.Join([]string{FtpTargetPrefix, today, logData.ID}, "/")
 	info.absFilePath = absFilePath
 	info.Target = storageTargetName
-	fd, err := os.OpenFile(info.absFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	fd, err := os.OpenFile(info.absFilePath, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		logger.Errorf("Create FTP file %s error: %s\n", absFilePath, err)
 		return nil, err
@@ -326,22 +349,6 @@ func (r *FTPFileRecorder) CreateFTPFileInfo(logData *model.FTPLog) (info *FTPFil
 	info.fd = fd
 	r.setFTPFile(logData.ID, info)
 	return info, nil
-}
-
-func (r *FTPFileRecorder) RecordFtpChunk(ftpLog *model.FTPLog, p []byte, off int64) (err error) {
-	if r.isNullStorage() {
-		return
-	}
-	info := r.getFTPFile(ftpLog.ID)
-	if info == nil {
-		info, err = r.CreateFTPFileInfo(ftpLog)
-	}
-	if err != nil {
-		return
-	}
-	_, _ = info.fd.Seek(off, io.SeekStart)
-	_, err = info.fd.Write(p)
-	return err
 }
 
 func (r *FTPFileRecorder) FinishFTPFile(id string) {
@@ -364,14 +371,42 @@ func (r *FTPFileRecorder) Record(ftpLog *model.FTPLog, reader io.Reader) (err er
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(info.fd, reader)
+	if err1 := info.WriteFromReader(reader); err1 != nil {
+		logger.Errorf("FTP file %s write err: %s", ftpLog.ID, err1)
+	}
+	_ = info.Close()
+	go r.UploadFile(3, ftpLog.ID)
+	return
+}
+
+func (r *FTPFileRecorder) ChunkedRecord(ftpLog *model.FTPLog, readerAt io.ReaderAt, offset, totalSize int64) (err error) {
+	if r.isNullStorage() {
+		return
+	}
+	info := r.getFTPFile(ftpLog.ID)
+	if info == nil {
+		info, err = r.CreateFTPFileInfo(ftpLog)
+	}
+	if err != nil {
+		return err
+	}
+
+	if info.isExceedWrittenSize() || totalSize >= info.maxWrittenSize {
+		logger.Errorf("FTP file %s is exceeds the max limit and discard it", ftpLog.ID)
+		return nil
+	}
+
+	if err1 := common.ChunkedFileTransfer(info.fd, readerAt, offset, totalSize); err1 != nil {
+		logger.Errorf("FTP file %s write err: %s", ftpLog.ID, err1)
+	}
+
 	_ = info.Close()
 	go r.UploadFile(3, ftpLog.ID)
 	return
 }
 
 func (r *FTPFileRecorder) isNullStorage() bool {
-	return r.storage.TypeName() == "null"
+	return r.storage.TypeName() == "null" || r.MaxFileSize == 0
 }
 
 func (r *FTPFileRecorder) exceedFileMaxSize(info *FTPFileInfo) bool {
@@ -437,6 +472,47 @@ type FTPFileInfo struct {
 
 	absFilePath string
 	Target      string
+
+	maxWrittenSize int64
+	writtenBytes   int64
+}
+
+func (f *FTPFileInfo) WriteFromReader(r io.Reader) error {
+	buf := make([]byte, 32*1024)
+	var err error
+	for {
+		nr, er := r.Read(buf)
+		if nr > 0 {
+			nw, ew := f.fd.Write(buf[0:nr])
+			if nw > 0 {
+				f.writtenBytes += int64(nw)
+				if f.isExceedWrittenSize() {
+					logger.Errorf("FTP file %s is exceeds the max limit and discard it",
+						f.ftpLog.ID)
+					return nil
+				}
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return err
+}
+
+func (f *FTPFileInfo) isExceedWrittenSize() bool {
+	return f.writtenBytes >= f.maxWrittenSize
 }
 
 func (f *FTPFileInfo) Close() error {

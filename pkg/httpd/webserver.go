@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/LeeEirc/elfinder"
@@ -23,6 +25,7 @@ import (
 
 const (
 	defaultBufferSize = 1024
+	WebsocketErrorf   = "Websocket upgrade err: %s"
 )
 
 var upGrader = websocket.Upgrader{
@@ -105,7 +108,7 @@ func (s *Server) SftpHostConnectorView(ctx *gin.Context) {
 func (s *Server) ProcessTerminalWebsocket(ctx *gin.Context) {
 	userConn, err := s.UpgradeUserWsConn(ctx)
 	if err != nil {
-		logger.Errorf("Websocket upgrade err: %s", err)
+		logger.Errorf(WebsocketErrorf, err)
 		return
 	}
 	s.runTTY(userConn)
@@ -114,12 +117,35 @@ func (s *Server) ProcessTerminalWebsocket(ctx *gin.Context) {
 func (s *Server) ProcessElfinderWebsocket(ctx *gin.Context) {
 	userConn, err := s.UpgradeUserWsConn(ctx)
 	if err != nil {
-		logger.Errorf("Websocket upgrade err: %s", err)
+		logger.Errorf(WebsocketErrorf, err)
 		return
 	}
 	userConn.handler = &webFolder{
 		ws:   userConn,
 		done: make(chan struct{}),
+	}
+	s.broadCaster.EnterUserWebsocket(userConn)
+	defer s.broadCaster.LeaveUserWebsocket(userConn)
+	userConn.Run()
+}
+
+func (s *Server) ChatAIWebsocket(ctx *gin.Context) {
+	userConn, err := s.UpgradeUserWsConn(ctx)
+	if err != nil {
+		logger.Errorf(WebsocketErrorf, err)
+		return
+	}
+
+	termConf, err := userConn.apiClient.GetTerminalConfig()
+	if err != nil {
+		logger.Errorf("Get terminal config failed: %s", err)
+		return
+	}
+
+	userConn.handler = &chat{
+		ws:              userConn,
+		conversationMap: sync.Map{},
+		termConf:        &termConf,
 	}
 	s.broadCaster.EnterUserWebsocket(userConn)
 	defer s.broadCaster.LeaveUserWebsocket(userConn)
@@ -137,7 +163,7 @@ func (s *Server) UpgradeUserWsConn(ctx *gin.Context) (*UserWebsocket, error) {
 	langCode := config.GetConf().LanguageCode
 	if acceptLang := ctx.GetHeader("Accept-Language"); acceptLang != "" {
 		apiClient.SetHeader("Accept-Language", acceptLang)
-		langCode = acceptLang
+		langCode = ParseAcceptLanguageCode(acceptLang)
 	}
 	if cookieLang, err2 := ctx.Cookie("django_language"); err2 == nil {
 		apiClient.SetCookie("django_language", cookieLang)
@@ -196,7 +222,7 @@ func (s *Server) GenerateViewMeta(targetId string) (meta ViewPageMata) {
 	if err != nil {
 		logger.Errorf("Get core api public setting err: %s", err)
 	}
-	meta.IconURL = setting.LogoURLS.Favicon
+	meta.IconURL = setting.Interface.Favicon
 	return
 }
 
@@ -206,4 +232,16 @@ func (s *Server) getPublicSetting() model.PublicSetting {
 		logger.Errorf("Get Public setting err: %s", err)
 	}
 	return setting
+}
+
+func ParseAcceptLanguageCode(language string) string {
+	// en,zh-TW;q=0.9,zh-CN;q=0.8,zh;q=0.7
+	// 解析出第一个语言代码
+	if language == "" {
+		return "zh-CN"
+	}
+	languages := strings.SplitN(language, ";", 2)
+	lang := strings.TrimSpace(languages[0])
+	languages = strings.SplitN(lang, ",", 2)
+	return languages[0]
 }

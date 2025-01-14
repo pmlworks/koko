@@ -57,14 +57,14 @@ type directOpt struct {
 
 	sftpMode bool
 
-	assets []model.Asset
+	assets []model.PermAsset
 }
 
 func (d directOpt) IsTokenConnection() bool {
 	return d.formatType == FormatToken
 }
 
-func DirectAssets(assets []model.Asset) DirectOpt {
+func DirectAssets(assets []model.PermAsset) DirectOpt {
 	return func(opts *directOpt) {
 		opts.assets = assets
 	}
@@ -149,7 +149,7 @@ type DirectHandler struct {
 
 	i18nLang string
 
-	selectAsset   *model.Asset
+	selectAsset   *model.PermAsset
 	selectAccount *model.PermAccount
 }
 
@@ -159,8 +159,33 @@ func (d *DirectHandler) NewSFTPHandler() *SftpHandler {
 	opts = append(opts, srvconn.WithUser(d.opts.User))
 	opts = append(opts, srvconn.WithRemoteAddr(addr))
 	opts = append(opts, srvconn.WithLoginFrom(model.LoginFromSSH))
+	opts = append(opts, srvconn.WithTerminalCfg(d.opts.terminalConf))
 	if !d.opts.IsTokenConnection() {
 		opts = append(opts, srvconn.WithAssets(d.opts.assets))
+		if len(d.opts.assets) == 1 {
+			asset := d.opts.assets[0]
+			if permAssetDetail, err := d.jmsService.GetUserPermAssetDetailById(d.opts.User.ID, asset.ID); err == nil {
+				matchedAccount := GetMatchedAccounts(permAssetDetail.PermedAccounts, d.opts.targetAccount)
+				if len(matchedAccount) == 1 {
+					selectAccount := &matchedAccount[0]
+					req := service.SuperConnectTokenReq{
+						UserId:        d.opts.User.ID,
+						AssetId:       asset.ID,
+						Account:       selectAccount.Alias,
+						Protocol:      model.ProtocolSFTP,
+						ConnectMethod: model.ProtocolSSH,
+						RemoteAddr:    addr,
+					}
+					if tokenInfo, err1 := d.jmsService.CreateSuperConnectToken(&req); err1 == nil {
+						if connectToken, err2 := d.jmsService.GetConnectTokenInfo(tokenInfo.ID); err2 == nil {
+							opts = append(opts, srvconn.WithConnectToken(&connectToken))
+							opts = append(opts, srvconn.WithAssets(nil))
+						}
+					}
+				}
+			}
+		}
+		opts = append(opts, srvconn.WithAccountUsername(d.opts.targetAccount))
 	} else {
 		opts = append(opts, srvconn.WithConnectToken(d.opts.tokenInfo))
 	}
@@ -315,9 +340,9 @@ func (d *DirectHandler) chooseAccount(permAccounts []model.PermAccount) (model.P
 	}
 }
 
-func (d *DirectHandler) displayAssets(assets []model.Asset) {
+func (d *DirectHandler) displayAssets(assets []model.PermAsset) {
 	assetListSortBy := d.opts.terminalConf.AssetListSortBy
-	model.AssetList(assets).SortBy(assetListSortBy)
+	model.PermAssetList(assets).SortBy(assetListSortBy)
 
 	vt := d.term
 	lang := i18n.NewLang(d.i18nLang)
@@ -361,16 +386,16 @@ func (d *DirectHandler) displayAssets(assets []model.Asset) {
 	utils.IgnoreErrWriteString(vt, utils.CharNewLine)
 }
 
-func (d *DirectHandler) Proxy(asset model.Asset) {
+func (d *DirectHandler) Proxy(asset model.PermAsset) {
 	d.selectAsset = &asset
 	lang := i18n.NewLang(d.i18nLang)
-	accounts, err := d.jmsService.GetAccountsByUserIdAndAssetId(d.opts.User.ID, asset.ID)
+	permAssetDetail, err := d.jmsService.GetUserPermAssetDetailById(d.opts.User.ID, asset.ID)
 	if err != nil {
 		logger.Errorf("Get account failed: %s", err)
 		utils.IgnoreErrWriteString(d.term, lang.T("Core API failed"))
 		return
 	}
-	matched := GetMatchedAccounts(accounts, d.opts.targetAccount)
+	matched := GetMatchedAccounts(permAssetDetail.PermedAccounts, d.opts.targetAccount)
 	if len(matched) == 0 {
 		msg := fmt.Sprintf(lang.T("not found matched username %s"), d.opts.targetAccount)
 		utils.IgnoreErrWriteString(d.term, msg+"\r\n")
@@ -390,7 +415,17 @@ func (d *DirectHandler) Proxy(asset model.Asset) {
 		Account:       selectAccount.Alias,
 		Protocol:      protocol,
 		ConnectMethod: model.ProtocolSSH,
+		RemoteAddr:    d.wrapperSess.RemoteAddr(),
 	}
+	if selectAccount.IsInputUser() {
+		inputUsername, err1 := GetInputUsername(d.wrapperSess)
+		if err1 != nil {
+			logger.Errorf("Get input username err: %s", err1)
+			return
+		}
+		req.InputUsername = inputUsername
+	}
+
 	tokenInfo, err := d.jmsService.CreateSuperConnectToken(&req)
 	if err != nil {
 		if tokenInfo.Code == "" {
@@ -402,6 +437,13 @@ func (d *DirectHandler) Proxy(asset model.Asset) {
 		case model.ACLReject:
 			logger.Errorf("Create connect token and auth info failed: %s", tokenInfo.Detail)
 			utils.IgnoreErrWriteString(d.term, lang.T("ACL reject"))
+			utils.IgnoreErrWriteString(d.term, utils.CharNewLine)
+			return
+		case model.ACLFaceVerify:
+			// todo: 需要人脸验证 后续需要发站内信通知用户，并且等待用户人脸验证通过
+			logger.Errorf("Create connect token and auth info failed: %s %s", tokenInfo.Code, tokenInfo.Detail)
+			msg := lang.T("Face verification is not supported yet. Please use the WebTerminal to connect the asset.")
+			utils.IgnoreErrWriteString(d.term, msg)
 			utils.IgnoreErrWriteString(d.term, utils.CharNewLine)
 			return
 		case model.ACLReview:

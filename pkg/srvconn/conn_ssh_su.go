@@ -12,12 +12,14 @@ func LoginToSSHSu(sc *SSHConnection) error {
 	if err != nil {
 		return err
 	}
-	if cfg.MethodType == SuMethodSu {
+	switch cfg.MethodType {
+	case SuMethodSu, SuMethodSudo,
+		SuMethodOnlySudo, SuMethodOnlySu:
 		startCmd := cfg.SuCommand()
 		suService.execCommand = func() {
 			_ = sc.session.Start(startCmd)
 		}
-	} else {
+	default:
 		_ = sc.session.Shell()
 	}
 	return suService.RunSwitchUser()
@@ -64,6 +66,10 @@ const (
 
 	LinuxSudoCommand = "sudo su - %s; exit"
 
+	LinuxOnlySuCommand = "su %s; exit"
+
+	LinuxOnlySudoCommand = "sudo su %s; exit"
+
 	/*
 		Cisco 相关
 	*/
@@ -86,7 +92,7 @@ const (
 	 \b: word boundary 即: 匹配某个单词边界
 	*/
 
-	passwordMatchPattern = "(?i)\\bpassword\\b\\s*:|密码"
+	passwordMatchPattern = "(?i)\\bpassword\\b\\s*|密码|password"
 
 	usernameMatchPattern = "(?i)username:?\\s*$|name:?\\s*$|用户名:?\\s*$"
 )
@@ -114,6 +120,8 @@ type SUMethodType string
 const (
 	SuMethodSudo       SUMethodType = "sudo"
 	SuMethodSu         SUMethodType = "su"
+	SuMethodOnlySudo   SUMethodType = "only_sudo"
+	SuMethodOnlySu     SUMethodType = "only_su"
 	SuMethodEnable     SUMethodType = "enable"
 	SuMethodSuper      SUMethodType = "super"
 	SuMethodSuperLevel SUMethodType = "super_level"
@@ -132,6 +140,10 @@ func NewSuMethodType(suMethod string) SUMethodType {
 		return SuMethodSu
 	case "sudo":
 		return SuMethodSudo
+	case "only_sudo":
+		return SuMethodOnlySudo
+	case "only_su":
+		return SuMethodOnlySu
 	default:
 
 	}
@@ -154,6 +166,10 @@ func (s *SuConfig) SuCommand() string {
 		return SuCommandSuperH3C
 	case SuMethodSudo:
 		return fmt.Sprintf(LinuxSudoCommand, s.SudoUsername)
+	case SuMethodOnlySudo:
+		return fmt.Sprintf(LinuxOnlySudoCommand, s.SudoUsername)
+	case SuMethodOnlySu:
+		return fmt.Sprintf(LinuxOnlySuCommand, s.SudoUsername)
 	default:
 
 	}

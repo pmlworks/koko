@@ -72,6 +72,9 @@ func createRouter(jmsService *service.JMService, webSrv *Server) *gin.Engine {
 		wsGroup.Group("/elfinder").Use(
 			auth.HTTPMiddleSessionAuth(jmsService)).GET("/", webSrv.ProcessElfinderWebsocket)
 
+		wsGroup.Group("/chat/system").Use(
+			auth.HTTPMiddleSessionAuth(jmsService)).GET("/", webSrv.ChatAIWebsocket)
+
 	}
 
 	connectGroup := kokoGroup.Group("/connect")
@@ -125,6 +128,15 @@ func createRouter(jmsService *service.JMService, webSrv *Server) *gin.Engine {
 			ctx.HTML(http.StatusOK, "file_manager.html", metaData)
 		})
 		elfinderGroup.Any("/connector/:host/", webSrv.SftpHostConnectorView)
+	}
+
+	k8sGroup := kokoGroup.Group("/k8s")
+	k8sGroup.Use(auth.HTTPMiddleSessionAuth(jmsService))
+	{
+		k8sGroup.GET("/", func(ctx *gin.Context) {
+			// https://github.com/gin-gonic/gin/issues/2654
+			ctx.FileFromFS("ui/dist/", http.FS(assets.UIFs))
+		})
 	}
 
 	debugGroup := eng.Group("/debug/pprof")

@@ -37,6 +37,8 @@ var (
 	ErrNoAuthInfo      = errors.New("no auth info")
 )
 
+const localIP = "127.0.0.1"
+
 func NewServer(conn UserConnection, jmsService *service.JMService, opts ...ConnectionOption) (*Server, error) {
 	connOpts := &ConnectionOptions{}
 	for _, setter := range opts {
@@ -92,6 +94,8 @@ func NewServer(conn UserConnection, jmsService *service.JMService, opts ...Conne
 		AccountID:  account.ID,
 		OrgID:      connOpts.authInfo.OrgId,
 		Type:       model.NORMALType,
+		TokenId:    connOpts.authInfo.Id,
+		LangCode:   connOpts.i18nLang,
 	}
 
 	if !connOpts.authInfo.Actions.EnableConnect() {
@@ -116,9 +120,6 @@ func NewServer(conn UserConnection, jmsService *service.JMService, opts ...Conne
 			_, err2 := jmsService.CreateSession(*apiSession)
 			return err2
 		},
-		ConnectedSuccessCallback: func() error {
-			return jmsService.SessionSuccess(apiSession.ID)
-		},
 		ConnectedFailedCallback: func(err error) error {
 			return jmsService.SessionFailed(apiSession.ID, err)
 		},
@@ -139,18 +140,16 @@ type Server struct {
 
 	suFromAccount *model.BaseAccount
 
-	terminalConf   *model.TerminalConfig
-	domainGateways *model.Domain
-	gateway        *model.Gateway
+	terminalConf *model.TerminalConfig
+	gateway      *model.Gateway
 
 	sessionInfo *model.Session
 
 	cacheSSHConnection *srvconn.SSHConnection
 
-	CreateSessionCallback    func() error
-	ConnectedSuccessCallback func() error
-	ConnectedFailedCallback  func(err error) error
-	DisConnectedCallback     func() error
+	CreateSessionCallback   func() error
+	ConnectedFailedCallback func(err error) error
+	DisConnectedCallback    func() error
 
 	keyboardMode int32
 
@@ -165,6 +164,8 @@ type SessionInfo struct {
 
 	BackspaceAsCtrlH *bool `json:"backspaceAsCtrlH,omitempty"`
 	CtrlCAsCtrlZ     bool  `json:"ctrlCAsCtrlZ"`
+
+	ThemeName string `json:"themeName"`
 }
 
 func (s *Server) IsKeyboardMode() bool {
@@ -207,6 +208,7 @@ func (s *Server) ZmodemFileTransferEvent(zinfo *zmodem.ZFileInfo, status bool) {
 			Path:       zinfo.Filename(),
 			DateStart:  modelCommon.NewUTCTime(zinfo.Time()),
 			IsSuccess:  status,
+			Session:    s.sessionInfo.ID,
 		}
 		if err := s.jmsService.CreateFileOperationLog(item); err != nil {
 			logger.Errorf("Create zmodem ftp log err: %s", err)
@@ -305,36 +307,11 @@ func (s *Server) GenerateCommandItem(user, input, output string, item *ExecutedC
 	}
 }
 
-func (s *Server) getUsernameIfNeed() (err error) {
-	if s.account.Username == "" {
-		logger.Infof("Conn[%s] need manuel input system user username", s.UserConn.ID())
-		var username string
-		vt := term.NewTerminal(s.UserConn, "username: ")
-		for {
-			username, err = vt.ReadLine()
-			if err != nil {
-				return err
-			}
-			username = strings.TrimSpace(username)
-			if username != "" {
-				break
-			}
-		}
-		s.account.Username = username
-		logger.Infof("Conn[%s] get username from user input: %s", s.UserConn.ID(), username)
-	}
-	return
-}
-
 func (s *Server) getAuthPasswordIfNeed() (err error) {
 	var line string
 	if s.account.Secret == "" {
 		vt := term.NewTerminal(s.UserConn, "password: ")
-		if s.account.Username != "" {
-			line, err = vt.ReadPassword(fmt.Sprintf("%s's password: ", s.account.Username))
-		} else {
-			line, err = vt.ReadPassword("password: ")
-		}
+		line, err = vt.ReadPassword(fmt.Sprintf("%s's password: ", s.account.String()))
 
 		if err != nil {
 			logger.Errorf("Conn[%s] get password from user err: %s", s.UserConn.ID(), err.Error())
@@ -362,29 +339,14 @@ func (s *Server) checkRequiredAuth() error {
 		srvconn.ProtocolMongoDB,
 
 		srvconn.ProtocolMySQL, srvconn.ProtocolMariadb,
-		srvconn.ProtocolSQLServer, srvconn.ProtocolPostgresql:
-		if err := s.getUsernameIfNeed(); err != nil {
-			msg := utils.WrapperWarn(lang.T("Get auth username failed"))
-			utils.IgnoreErrWriteString(s.UserConn, msg)
-			return fmt.Errorf("get auth username failed: %s", err)
-		}
-		if err := s.getAuthPasswordIfNeed(); err != nil {
-			msg := utils.WrapperWarn(lang.T("Get auth password failed"))
-			utils.IgnoreErrWriteString(s.UserConn, msg)
-			return fmt.Errorf("get auth password failed: %s", err)
-		}
-	case srvconn.ProtocolRedis:
+		srvconn.ProtocolSQLServer, srvconn.ProtocolPostgresql,
+		srvconn.ProtocolRedis, srvconn.ProtocolOracle:
 		if err := s.getAuthPasswordIfNeed(); err != nil {
 			msg := utils.WrapperWarn(lang.T("Get auth password failed"))
 			utils.IgnoreErrWriteString(s.UserConn, msg)
 			return fmt.Errorf("get auth password failed: %s", err)
 		}
 	case srvconn.ProtocolSSH:
-		if err := s.getUsernameIfNeed(); err != nil {
-			msg := utils.WrapperWarn(lang.T("Get auth username failed"))
-			utils.IgnoreErrWriteString(s.UserConn, msg)
-			return err
-		}
 		if s.checkReuseSSHClient() {
 			if cacheConn, ok := s.getCacheSSHConn(); ok {
 				s.cacheSSHConnection = cacheConn
@@ -465,31 +427,23 @@ func (s *Server) getCacheSSHConn() (srvConn *srvconn.SSHConnection, ok bool) {
 	return cacheConn, true
 }
 
-func (s *Server) createAvailableGateWay(domain *model.Domain) (*domainGateway, error) {
+func (s *Server) createAvailableGateWay() (*domainGateway, error) {
 	asset := s.connOpts.authInfo.Asset
 	protocol := s.connOpts.authInfo.Protocol
-
-	var dGateway *domainGateway
-	switch protocol {
-	case srvconn.ProtocolK8s:
-		dstHost, dstPort, err := ParseUrlHostAndPort(asset.Address)
+	dstIP := asset.Address
+	dstPort := asset.ProtocolPort(protocol)
+	if protocol == srvconn.ProtocolK8s {
+		dstHost, dstPort1, err := ParseUrlHostAndPort(asset.Address)
 		if err != nil {
 			return nil, err
 		}
-		dGateway = &domainGateway{
-			domain:          domain,
-			dstIP:           dstHost,
-			dstPort:         dstPort,
-			selectedGateway: s.gateway,
-		}
-	default:
-		port := asset.ProtocolPort(protocol)
-		dGateway = &domainGateway{
-			domain:          domain,
-			dstIP:           asset.Address,
-			dstPort:         port,
-			selectedGateway: s.gateway,
-		}
+		dstIP = dstHost
+		dstPort = dstPort1
+	}
+	dGateway := &domainGateway{
+		dstIP:           dstIP,
+		dstPort:         dstPort,
+		selectedGateway: s.gateway,
 	}
 	return dGateway, nil
 }
@@ -499,11 +453,11 @@ func (s *Server) getK8sConConn(localTunnelAddr *net.TCPAddr) (srvConn srvconn.Se
 	asset := s.connOpts.authInfo.Asset
 	clusterServer := asset.Address
 	if localTunnelAddr != nil {
-		originUrl, err := url.Parse(clusterServer)
-		if err != nil {
-			return nil, err
+		originUrl, err1 := url.Parse(clusterServer)
+		if err1 != nil {
+			return nil, err1
 		}
-		clusterServer = ReplaceURLHostAndPort(originUrl, "127.0.0.1", localTunnelAddr.Port)
+		clusterServer = ReplaceURLHostAndPort(originUrl, localIP, localTunnelAddr.Port)
 	}
 	if s.connOpts.k8sContainer != nil {
 		return s.getContainerConn(clusterServer)
@@ -552,7 +506,7 @@ func (s *Server) getRedisConn(localTunnelAddr *net.TCPAddr) (srvConn *srvconn.Re
 	host := asset.Address
 	port := asset.ProtocolPort(protocol)
 	if localTunnelAddr != nil {
-		host = "127.0.0.1"
+		host = localIP
 		port = localTunnelAddr.Port
 	}
 	username := s.account.Username
@@ -584,10 +538,13 @@ func (s *Server) getMongoDBConn(localTunnelAddr *net.TCPAddr) (srvConn *srvconn.
 	host := asset.Address
 	port := asset.ProtocolPort(protocol)
 	if localTunnelAddr != nil {
-		host = "127.0.0.1"
+		host = localIP
 		port = localTunnelAddr.Port
 	}
-
+	platform := s.connOpts.authInfo.Platform
+	protocolSetting := platform.GetProtocol("mongodb")
+	authSource := protocolSetting.Setting.AuthSource
+	connectionOpts := protocolSetting.Setting.ConnectionOpts
 	srvConn, err = srvconn.NewMongoDBConnection(
 		srvconn.SqlHost(host),
 		srvconn.SqlPort(port),
@@ -598,29 +555,8 @@ func (s *Server) getMongoDBConn(localTunnelAddr *net.TCPAddr) (srvConn *srvconn.
 		srvconn.SqlCaCert(asset.SecretInfo.CaCert),
 		srvconn.SqlCertKey(asset.SecretInfo.ClientKey),
 		srvconn.SqlAllowInvalidCert(asset.SpecInfo.AllowInvalidCert),
-		srvconn.SqlPtyWin(srvconn.Windows{
-			Width:  s.UserConn.Pty().Window.Width,
-			Height: s.UserConn.Pty().Window.Height,
-		}),
-	)
-	return
-}
-
-func (s *Server) getClickHouseConn(localTunnelAddr *net.TCPAddr) (srvConn *srvconn.ClickHouseConn, err error) {
-	asset := s.connOpts.authInfo.Asset
-	protocol := s.connOpts.authInfo.Protocol
-	host := asset.Address
-	port := asset.ProtocolPort(protocol)
-	if localTunnelAddr != nil {
-		host = "127.0.0.1"
-		port = localTunnelAddr.Port
-	}
-	srvConn, err = srvconn.NewClickHouseConnection(
-		srvconn.SqlHost(host),
-		srvconn.SqlPort(port),
-		srvconn.SqlUsername(s.account.Username),
-		srvconn.SqlPassword(s.account.Secret),
-		srvconn.SqlDBName(asset.SpecInfo.DBName),
+		srvconn.SqlAuthSource(authSource),
+		srvconn.SqlConnectionOptions(connectionOpts),
 		srvconn.SqlPtyWin(srvconn.Windows{
 			Width:  s.UserConn.Pty().Window.Width,
 			Height: s.UserConn.Pty().Window.Height,
@@ -699,8 +635,9 @@ func (s *Server) getSSHConn() (srvConn *srvconn.SSHConnection, err error) {
 
 	platform := s.connOpts.authInfo.Platform
 	pty := s.UserConn.Pty()
+	charset := s.getCharset()
 	sshConnectOpts := make([]srvconn.SSHOption, 0, 6)
-	sshConnectOpts = append(sshConnectOpts, srvconn.SSHCharset(platform.Charset.Value))
+	sshConnectOpts = append(sshConnectOpts, srvconn.SSHCharset(charset))
 	sshConnectOpts = append(sshConnectOpts, srvconn.SSHTerm(pty.Term))
 	sshConnectOpts = append(sshConnectOpts, srvconn.SSHPtyWin(srvconn.Windows{
 		Width:  pty.Window.Width,
@@ -860,29 +797,6 @@ func (s *Server) getGatewayProxyOptions() []srvconn.SSHClientOptions {
 		}
 		return []srvconn.SSHClientOptions{proxyArg}
 	}
-	// 多个网关的情况
-	if s.domainGateways != nil && len(s.domainGateways.Gateways) != 0 {
-		timeout := config.GlobalConfig.SSHTimeout
-		proxyArgs := make([]srvconn.SSHClientOptions, 0, len(s.domainGateways.Gateways))
-		for i := range s.domainGateways.Gateways {
-			gateway := s.domainGateways.Gateways[i]
-			loginAccount := gateway.Account
-			port := gateway.Protocols.GetProtocolPort(model.ProtocolSSH)
-			proxyArg := srvconn.SSHClientOptions{
-				Host:     gateway.Address,
-				Port:     strconv.Itoa(port),
-				Username: loginAccount.Username,
-				Timeout:  timeout,
-			}
-			if loginAccount.IsSSHKey() {
-				proxyArg.PrivateKey = loginAccount.Secret
-			} else {
-				proxyArg.Password = loginAccount.Secret
-			}
-			proxyArgs = append(proxyArgs, proxyArg)
-		}
-		return proxyArgs
-	}
 	return nil
 }
 
@@ -908,15 +822,13 @@ func (s *Server) getServerConn(proxyAddr *net.TCPAddr) (srvconn.ServerConnection
 		return s.getRedisConn(proxyAddr)
 	case srvconn.ProtocolMongoDB:
 		return s.getMongoDBConn(proxyAddr)
-	case srvconn.ProtocolClickHouse:
-		return s.getClickHouseConn(proxyAddr)
-
-	case srvconn.ProtocolMySQL, srvconn.ProtocolMariadb:
-		return s.getMySQLConn(proxyAddr)
-	case srvconn.ProtocolPostgresql:
-		return s.getPostgreSQLConn(proxyAddr)
-	case srvconn.ProtocolSQLServer:
-		return s.getSQLServerConn(proxyAddr)
+	case srvconn.ProtocolMySQL,
+		srvconn.ProtocolMariadb,
+		srvconn.ProtocolPostgresql,
+		srvconn.ProtocolSQLServer,
+		srvconn.ProtocolClickHouse,
+		srvconn.ProtocolOracle:
+		return s.getUSQLConn(proxyAddr)
 	default:
 		return nil, ErrUnMatchProtocol
 	}
@@ -965,6 +877,10 @@ func (s *Server) getCharset() string {
 			charset = common.UTF8
 		case "gbk":
 			charset = common.GBK
+		case "gb2312":
+			charset = common.GB2312
+		case "ios-8859-1", "ascii":
+			charset = common.ISOLatin1
 		default:
 		}
 	}
@@ -1008,11 +924,23 @@ func (s *Server) Proxy() {
 		reviewTicketId := s.connOpts.authInfo.Ticket.ID
 		msg := fmt.Sprintf("Conn[%s] create session %s ticket %s relation",
 			s.UserConn.ID(), s.ID, reviewTicketId)
-		logger.Infof(msg)
+		logger.Info(msg)
 		if err := s.jmsService.CreateSessionTicketRelation(s.sessionInfo.ID, reviewTicketId); err != nil {
 			logger.Errorf("%s err: %s", msg, err)
 		}
 	}
+	if s.connOpts.authInfo.FaceMonitorToken != "" {
+		faceMonitorToken := s.connOpts.authInfo.FaceMonitorToken
+		faceReq := service.JoinFaceMonitorRequest{
+			FaceMonitorToken: faceMonitorToken,
+			SessionId:        s.sessionInfo.ID,
+		}
+		logger.Infof("Conn[%s] join face monitor %s", s.UserConn.ID(), faceMonitorToken)
+		if err := s.jmsService.JoinFaceMonitor(faceReq); err != nil {
+			logger.Errorf("Conn[%s] join face monitor err: %s", s.UserConn.ID(), err)
+		}
+	}
+
 	traceSession := session.NewSession(sw.p.sessionInfo, func(task *model.TerminalTask) error {
 		switch task.Name {
 		case model.TaskKillSession:
@@ -1021,6 +949,10 @@ func (s *Server) Proxy() {
 			sw.PauseOperation(task.Kwargs.CreatedByUser)
 		case model.TaskUnlockSession:
 			sw.ResumeOperation(task.Kwargs.CreatedByUser)
+		case model.TaskPermExpired:
+			sw.PermBecomeExpired(task.Name, task.Args)
+		case model.TaskPermValid:
+			sw.PermBecomeValid(task.Name, task.Args)
 		default:
 			return fmt.Errorf("ssh session unknown task %s", task.Name)
 		}
@@ -1034,13 +966,13 @@ func (s *Server) Proxy() {
 		}
 	}()
 	var proxyAddr *net.TCPAddr
-	if (s.domainGateways != nil && len(s.domainGateways.Gateways) != 0) || s.gateway != nil {
+	if s.gateway != nil {
 		protocol := s.connOpts.authInfo.Protocol
 		switch protocol {
 		case srvconn.ProtocolSSH, srvconn.ProtocolTELNET:
 			// ssh 和 telnet 协议不需要本地启动代理
 		default:
-			dGateway, err := s.createAvailableGateWay(s.domainGateways)
+			dGateway, err := s.createAvailableGateWay()
 			if err != nil {
 				msg := lang.T("Start domain gateway failed %s")
 				msg = fmt.Sprintf(msg, err)
@@ -1067,14 +999,20 @@ func (s *Server) Proxy() {
 		if err2 := s.ConnectedFailedCallback(err); err2 != nil {
 			logger.Errorf("Conn[%s] update session err: %s", s.UserConn.ID(), err2)
 		}
+		errLog := model.SessionLifecycleLog{Reason: err.Error()}
+		if err1 := s.jmsService.RecordSessionLifecycleLog(s.sessionInfo.ID, model.AssetConnectFinished,
+			errLog); err1 != nil {
+			logger.Errorf("Conn[%s] record session activity log err: %s", s.UserConn.ID(), err1)
+		}
 		return
 	}
 	defer srvCon.Close()
+	if err1 := s.jmsService.RecordSessionLifecycleLog(s.sessionInfo.ID, model.AssetConnectSuccess,
+		model.EmptyLifecycleLog); err1 != nil {
+		logger.Errorf("Conn[%s] record session activity log err: %s", s.UserConn.ID(), err1)
+	}
 
 	logger.Infof("Conn[%s] create session %s success", s.UserConn.ID(), s.ID)
-	if err2 := s.ConnectedSuccessCallback(); err2 != nil {
-		logger.Errorf("Conn[%s] update session %s err: %s", s.UserConn.ID(), s.ID, err2)
-	}
 	if s.OnSessionInfo != nil {
 		actions := s.connOpts.authInfo.Actions
 		tokenConnOpts := s.connOpts.authInfo.ConnectOptions
@@ -1091,6 +1029,7 @@ func (s *Server) Proxy() {
 
 			BackspaceAsCtrlH: tokenConnOpts.BackspaceAsCtrlH,
 			CtrlCAsCtrlZ:     ctrlCAsCtrlZ,
+			ThemeName:        tokenConnOpts.TerminalThemeName,
 		}
 		go s.OnSessionInfo(&info)
 	}

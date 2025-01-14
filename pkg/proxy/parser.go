@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LeeEirc/tclientlib"
+	"github.com/jumpserver/koko/pkg/config"
 	"github.com/jumpserver/koko/pkg/exchange"
 	"github.com/jumpserver/koko/pkg/i18n"
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -20,6 +21,7 @@ import (
 
 var (
 	charEnter = []byte("\r")
+	charLF    = []byte("\n")
 
 	enterMarks = [][]byte{
 		[]byte("\x1b[?1049h"),
@@ -33,6 +35,10 @@ var (
 		[]byte("\x1b[?1048l"),
 		[]byte("\x1b[?1047l"),
 		[]byte("\x1b[?47l"),
+	}
+	screenMarks = [][]byte{
+		[]byte{0x1b, 0x5b, 0x4b, 0x0d, 0x0a},
+		[]byte{0x1b, 0x5b, 0x34, 0x6c},
 	}
 )
 
@@ -86,6 +92,8 @@ type Parser struct {
 	currentCmdFilterRule CommandRule
 
 	userInputFilter func([]byte) []byte
+
+	disableInputAsCmd bool
 }
 
 func (p *Parser) setCurrentCmdStatusLevel(level int64) {
@@ -114,6 +122,7 @@ func (p *Parser) initial() {
 	p.cmdOutputParser = NewCmdParser(p.id, CommandOutputParserName)
 	p.closed = make(chan struct{})
 	p.cmdRecordChan = make(chan *ExecutedCommand, 1024)
+	p.disableInputAsCmd = config.GetConf().DisableInputAsCommand
 }
 
 func (p *Parser) SetUserInputFilter(filter func([]byte) []byte) {
@@ -185,6 +194,16 @@ func (p *Parser) ParseStream(userInChan chan *exchange.RoomMessage, srvInChan <-
 	return p.userOutputChan, p.srvOutputChan
 }
 
+func (p *Parser) isEnterKeyPress(b []byte) bool {
+	if bytes.LastIndex(b, charEnter) == 0 {
+		return true
+	}
+	if len(b) > 1 && bytes.HasSuffix(b, charLF) && isLinux(p.platform) {
+		return true
+	}
+	return false
+}
+
 // parseInputState 切换用户输入状态, 并结算命令和结果
 func (p *Parser) parseInputState(b []byte) []byte {
 	lang := i18n.NewLang(p.i18nLang)
@@ -243,7 +262,25 @@ func (p *Parser) parseInputState(b []byte) []byte {
 			p.confirmStatus.Status)
 		return nil
 	}
-	waitMsg := lang.T("the reviewers will confirm. continue or not [Y/n]")
+
+	WarnWaitMsg := lang.T("The command you executed is risky and an alert notification will be sent to the administrator. Do you want to continue?[Y/N]")
+	if p.confirmStatus.InQuery() && p.getCurrentCmdStatusLevel() == model.WarningLevel {
+		switch strings.ToLower(string(b)) {
+		case "y":
+			p.confirmStatus.SetStatus(StatusNone)
+			p.userOutputChan <- []byte("\r\n")
+		case "n":
+			p.confirmStatus.SetStatus(StatusNone)
+			p.srvOutputChan <- []byte("\r\n")
+			p.command = ""
+			return p.breakInputPacket()
+		default:
+			p.srvOutputChan <- []byte("\r\n" + WarnWaitMsg)
+		}
+		return nil
+	}
+
+	confirmWaitMsg := lang.T("The command '%s' requires review. Continue or not [Y/n]?")
 	if p.confirmStatus.InQuery() {
 		switch strings.ToLower(string(b)) {
 		case "y":
@@ -290,17 +327,22 @@ func (p *Parser) parseInputState(b []byte) []byte {
 			p.srvOutputChan <- []byte("\r\n")
 			return p.breakInputPacket()
 		default:
-			p.srvOutputChan <- []byte("\r\n" + waitMsg)
+			confirmMsg := fmt.Sprintf(confirmWaitMsg, stripNewLine(p.confirmStatus.Cmd))
+			p.srvOutputChan <- []byte("\r\n" + confirmMsg)
 		}
 		return nil
 	}
-
-	if bytes.LastIndex(b, charEnter) == 0 {
+	p.writeInputBuffer(b)
+	if p.isEnterKeyPress(b) {
 		// 连续输入enter key, 结算上一条可能存在的命令结果
 		p.sendCommandRecord()
 		p.inputState = false
 		// 用户输入了Enter，开始结算命令
 		p.parseCmdInput()
+		if p.command == "" {
+			p.command = strings.TrimSpace(p.readInputBuffer())
+		}
+		p.clearInputBuffer()
 		if rule, cmd, ok := p.IsMatchCommandRule(p.command); ok {
 			switch rule.Acl.Action {
 			case model.ActionReject:
@@ -315,18 +357,24 @@ func (p *Parser) parseInputState(b []byte) []byte {
 				p.confirmStatus.SetCmd(p.command)
 				p.confirmStatus.SetData(string(b))
 				p.confirmStatus.ResetCtx()
-				p.srvOutputChan <- []byte("\r\n" + waitMsg)
+				confirmMsg := fmt.Sprintf(confirmWaitMsg, stripNewLine(p.confirmStatus.Cmd))
+				p.srvOutputChan <- []byte("\r\n" + confirmMsg)
 				return nil
 			case model.ActionWarning:
 				p.setCurrentCmdFilterRule(rule)
 				p.setCurrentCmdStatusLevel(model.WarningLevel)
 				logger.Debugf("Session %s: command %s match warning rule", p.id, p.command)
+			case model.ActionNotifyAndWarn:
+				p.confirmStatus.SetStatus(StatusQuery)
+				p.setCurrentCmdFilterRule(rule)
+				p.setCurrentCmdStatusLevel(model.WarningLevel)
+				logger.Debugf("Session %s: command %s match notify and warn rule", p.id, p.command)
+				p.srvOutputChan <- []byte("\r\n" + WarnWaitMsg)
+				return nil
 			default:
 			}
 		}
-		p.clearInputBuffer()
 	} else {
-		p.writeInputBuffer(b)
 		if p.supportMultiCmd() && bytes.Contains(b, charEnter) {
 			p.isMultipleCmd = true
 			p.command = p.readInputBuffer()
@@ -347,11 +395,17 @@ func (p *Parser) parseInputState(b []byte) []byte {
 					p.confirmStatus.SetCmd(p.command)
 					p.confirmStatus.SetData(string(b))
 					p.confirmStatus.ResetCtx()
-					p.srvOutputChan <- []byte("\r\n" + waitMsg)
+					p.srvOutputChan <- []byte("\r\n" + confirmWaitMsg)
 					return nil
 				case model.ActionWarning:
 					p.setCurrentCmdFilterRule(rule)
 					p.setCurrentCmdStatusLevel(model.WarningLevel)
+				case model.ActionNotifyAndWarn:
+					p.confirmStatus.SetStatus(StatusQuery)
+					p.setCurrentCmdFilterRule(rule)
+					p.setCurrentCmdStatusLevel(model.WarningLevel)
+					p.srvOutputChan <- []byte("\r\n" + WarnWaitMsg)
+					return nil
 				default:
 				}
 			}
@@ -360,10 +414,10 @@ func (p *Parser) parseInputState(b []byte) []byte {
 		p.inputState = true
 		// 用户又开始输入，并上次不处于输入状态，开始结算上次命令的结果
 		if !p.inputPreState {
-			p.sendCommandRecord()
 			if ps1 := p.cmdOutputParser.GetPs1(); ps1 != "" {
 				p.cmdInputParser.SetPs1(ps1)
 			}
+			p.sendCommandRecord()
 		}
 	}
 	return b
@@ -390,6 +444,9 @@ func (p *Parser) IsNeedParse() bool {
 }
 
 func (p *Parser) writeInputBuffer(b []byte) {
+	if p.disableInputAsCmd {
+		return
+	}
 	p.inputBuffer.Write(b)
 }
 
@@ -452,8 +509,10 @@ func (p *Parser) parseZmodemState(b []byte) {
 // parseVimState 解析vim的状态，处于vim状态中，里面输入的命令不再记录
 func (p *Parser) parseVimState(b []byte) {
 	if !p.inVimState && IsEditEnterMode(b) {
-		p.inVimState = true
-		logger.Debug("In vim state: true")
+		if !isNewScreen(b) {
+			p.inVimState = true
+			logger.Debug("In vim state: true")
+		}
 	}
 	if p.inVimState && IsEditExitMode(b) {
 		p.inVimState = false
@@ -479,10 +538,8 @@ func (p *Parser) splitCmdStream(b []byte) []byte {
 			p.userOutputChan <- charEnter
 			return nil
 		}
-		if !p.zmodemParser.IsStartSession() {
-			p.srvOutputChan <- b
+		if !p.zmodemParser.IsStartSession() && p.zmodemParser.AbnormalFinish {
 			p.srvOutputChan <- []byte{0x4f, 0x4f}
-			return nil
 		}
 		return b
 	} else {
@@ -517,7 +574,7 @@ func (p *Parser) IsMatchCommandRule(command string) (CommandRule,
 		rule := p.cmdFilterACLs[i]
 		item, allowed, cmd := rule.Match(command)
 		switch allowed {
-		case model.ActionAccept, model.ActionWarning:
+		case model.ActionAccept, model.ActionWarning, model.ActionNotifyAndWarn:
 			return CommandRule{Acl: &rule, Item: &item}, cmd, true
 		case model.ActionReview, model.ActionReject:
 			return CommandRule{Acl: &rule, Item: &item}, cmd, true
@@ -546,7 +603,7 @@ func (p *Parser) waitCommandConfirm() {
 	cancelReq := resp.CloseReq
 	detailURL := resp.TicketDetailUrl
 	reviewers := resp.Reviewers
-	msg := lang.T("Please waiting for the reviewers to confirm command `%s`, cancel by CTRL+C.")
+	msg := lang.T("Please waiting for the reviewers to confirm command `%s`, cancel by CTRL+C or CTRL+D.")
 	cmd = strings.ReplaceAll(cmd, "\r", "")
 	cmd = strings.ReplaceAll(cmd, "\n", "")
 	waitMsg := fmt.Sprintf(msg, cmd)
@@ -559,6 +616,7 @@ func (p *Parser) waitCommandConfirm() {
 		titleMsg := lang.T("Need ticket confirm to execute command, already send email to the reviewers")
 		reviewersMsg := fmt.Sprintf(lang.T("Ticket Reviewers: %s"), strings.Join(reviewers, ", "))
 		detailURLMsg := fmt.Sprintf(lang.T("Could copy website URL to notify reviewers: %s"), detailURL)
+		spinner := []string{".   ", "..  ", "... "}
 		var tipString strings.Builder
 		tipString.WriteString(utils.CharNewLine)
 		tipString.WriteString(titleMsg)
@@ -566,6 +624,8 @@ func (p *Parser) waitCommandConfirm() {
 		tipString.WriteString(reviewersMsg)
 		tipString.WriteString(utils.CharNewLine)
 		tipString.WriteString(detailURLMsg)
+		tipString.WriteString(utils.CharNewLine)
+		tipString.WriteString(waitMsg)
 		tipString.WriteString(utils.CharNewLine)
 		p.srvOutputChan <- []byte(utils.WrapperString(tipString.String(), utils.Green))
 		for {
@@ -576,7 +636,8 @@ func (p *Parser) waitCommandConfirm() {
 				return
 			default:
 				delayS := fmt.Sprintf("%ds", delay)
-				data := strings.Repeat("\x08", len(delayS)+len(waitMsg)) + waitMsg + delayS
+				currentSpinner := spinner[delay%len(spinner)]
+				data := strings.Repeat("\x08", len(delayS)+len(currentSpinner)) + currentSpinner + delayS
 				p.srvOutputChan <- []byte(data)
 				time.Sleep(time.Second)
 				delay += 1
@@ -704,6 +765,10 @@ type CurrentActiveUser struct {
 	RemoteAddr string
 }
 
+func isNewScreen(p []byte) bool {
+	return matchMark(p, screenMarks)
+}
+
 func IsEditEnterMode(p []byte) bool {
 	return matchMark(p, enterMarks)
 }
@@ -767,6 +832,9 @@ func (p *Parser) breakInputPacket() []byte {
 		}
 		if isCisco(p.platform) || isLinux(p.platform) {
 			return []byte{CharCTRLE, utils.CharCleanLine, '\r'}
+		}
+		if isH3C(p.platform) {
+			return []byte{CharCTRLE, CharCTRLX, '\r'}
 		}
 		return []byte{tclientlib.IAC, tclientlib.BRK, '\r'}
 	case model.ProtocolSSH:

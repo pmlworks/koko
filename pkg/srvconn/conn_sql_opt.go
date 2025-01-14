@@ -1,17 +1,15 @@
 package srvconn
 
-import (
-	"database/sql"
-	"time"
-)
-
 type sqlOption struct {
+	AssetName        string
+	Schema           string
 	Username         string
 	Password         string
 	DBName           string
 	Host             string
 	Port             int
 	UseSSL           bool
+	SqlPgSSLMode     string
 	CaCert           string
 	CaCertPath       string
 	ClientCert       string
@@ -22,10 +20,23 @@ type sqlOption struct {
 
 	win Windows
 
-	disableMySQLAutoRehash bool
+	AuthSource        string
+	ConnectionOptions string
 }
 
 type SqlOption func(*sqlOption)
+
+func SqlSchema(schema string) SqlOption {
+	return func(args *sqlOption) {
+		args.Schema = schema
+	}
+}
+
+func SqlAssetName(assetName string) SqlOption {
+	return func(args *sqlOption) {
+		args.AssetName = assetName
+	}
+}
 
 func SqlUsername(username string) SqlOption {
 	return func(args *sqlOption) {
@@ -63,6 +74,13 @@ func SqlUseSSL(useSSL bool) SqlOption {
 	}
 }
 
+func SqlPGSSLMode(mode string) SqlOption {
+	return func(args *sqlOption) {
+		args.SqlPgSSLMode = mode
+
+	}
+}
+
 func SqlCaCert(caCert string) SqlOption {
 	return func(args *sqlOption) {
 		args.CaCert = caCert
@@ -93,24 +111,14 @@ func SqlPtyWin(win Windows) SqlOption {
 	}
 }
 
-const (
-	maxSQLConnCount = 1
-	maxIdleTime     = time.Second * 15
-)
+func SqlAuthSource(authSource string) SqlOption {
+	return func(args *sqlOption) {
+		args.AuthSource = authSource
+	}
+}
 
-func checkDatabaseAccountValidate(driveName, datasourceName string) error {
-	db, err := sql.Open(driveName, datasourceName)
-	if err != nil {
-		return err
+func SqlConnectionOptions(options string) SqlOption {
+	return func(args *sqlOption) {
+		args.ConnectionOptions = options
 	}
-	db.SetMaxOpenConns(maxSQLConnCount)
-	db.SetMaxIdleConns(maxSQLConnCount)
-	db.SetConnMaxLifetime(maxIdleTime)
-	db.SetConnMaxIdleTime(maxIdleTime)
-	defer db.Close()
-	err = db.Ping()
-	if err != nil {
-		return err
-	}
-	return nil
 }

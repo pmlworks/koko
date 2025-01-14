@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jumpserver/koko/pkg/localcommand"
+	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/mediocregopher/radix/v3"
 )
 
@@ -95,7 +96,12 @@ func (conn *RedisConn) Close() error {
 
 func startRedisCommand(opt *sqlOption) (lcmd *localcommand.LocalCommand, err error) {
 	cmd := opt.RedisCommandArgs()
-	lcmd, err = localcommand.New("redis-cli", cmd, localcommand.WithPtyWin(opt.win.Width, opt.win.Height))
+	opts, err := BuildNobodyWithOpts(localcommand.WithPtyWin(opt.win.Width, opt.win.Height))
+	if err != nil {
+		logger.Errorf("build nobody with opts error: %s", err)
+		return nil, err
+	}
+	lcmd, err = localcommand.New("redis-cli", cmd, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +154,10 @@ func checkRedisAccount(args *sqlOption) error {
 
 	if args.UseSSL {
 		tlsConfig := tls.Config{}
+		// 连接使用的是内部地址或者localhost时，跳过证书验证
+		if args.Host == "127.0.0.1" || args.Host == "localhost" {
+			tlsConfig.InsecureSkipVerify = true
+		}
 		if args.CaCert != "" {
 			rootCAs := x509.NewCertPool()
 			rootCAs.AppendCertsFromPEM([]byte(args.CaCert))

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gliderlabs/ssh"
+	"github.com/jumpserver/koko/pkg/cache"
 	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 
@@ -29,23 +31,23 @@ import (
 
 const ctxID = "ctxID"
 
-func (s *Server) PasswordAuth(ctx ssh.Context, password string) ssh.AuthResult {
+func (s *Server) PasswordAuth(ctx ssh.Context, password string) error {
 	ctx.SetValue(ctxID, ctx.SessionID())
 	tConfig := s.GetTerminalConfig()
 	if !tConfig.PasswordAuth {
-		logger.Info("Core API disable password auth auth")
-		return ssh.AuthFailed
+		logger.Info("Core API disable password auth")
+		return errors.New("password auth disabled")
 	}
 	sshAuthHandler := auth.SSHPasswordAndPublicKeyAuth(s.jmsService)
 	return sshAuthHandler(ctx, password, "")
 }
 
-func (s *Server) PublicKeyAuth(ctx ssh.Context, key ssh.PublicKey) ssh.AuthResult {
+func (s *Server) PublicKeyAuth(ctx ssh.Context, key ssh.PublicKey) error {
 	ctx.SetValue(ctxID, ctx.SessionID())
 	tConfig := s.GetTerminalConfig()
 	if !tConfig.PublicKeyAuth {
 		logger.Info("Core API disable publickey auth")
-		return ssh.AuthFailed
+		return errors.New("publickey auth disabled")
 	}
 	sshAuthHandler := auth.SSHPasswordAndPublicKeyAuth(s.jmsService)
 	value := string(gossh.MarshalAuthorizedKey(key))
@@ -68,6 +70,14 @@ func (s *Server) SFTPHandler(sess ssh.Session) {
 			logger.Errorf("Get matched assets failed: %s", err)
 			return
 		}
+		if directRequest.IsToken() && config.GetConf().ConnectionTokenReusable {
+			tokenInfo := directRequest.ConnectToken
+			key := cache.CreateAddrCacheKey(sess.RemoteAddr(), tokenInfo.Id)
+			// 缓存 token 信息
+			cache.TokenCacheInstance.Save(key, tokenInfo)
+			defer cache.TokenCacheInstance.Recycle(key)
+			logger.Infof("SFTP token key %s cached", key)
+		}
 		opts := buildDirectRequestOptions(currentUser, directRequest)
 		opts = append(opts, DirectConnectSftpMode(true))
 		opts = append(opts, DirectAssets(selectedAssets))
@@ -75,7 +85,7 @@ func (s *Server) SFTPHandler(sess ssh.Session) {
 		directSrv := NewDirectHandler(sess, s.jmsService, opts...)
 		sftpHandler = directSrv.NewSFTPHandler()
 	} else {
-		sftpHandler = NewSFTPHandler(s.jmsService, currentUser, addr)
+		sftpHandler = s.NewSftpHandler(currentUser, addr)
 	}
 	handlers := sftp.Handlers{
 		FileGet:  sftpHandler,
@@ -94,6 +104,19 @@ func (s *Server) SFTPHandler(sess ssh.Session) {
 	_ = req.Close()
 	sftpHandler.Close()
 	logger.Infof("SFTP request %s: Handler exit.", reqID)
+}
+
+func (s *Server) NewSftpHandler(user *model.User, addr string) *SftpHandler {
+	terminalCfg := s.GetTerminalConfig()
+	opts := make([]srvconn.UserSftpOption, 0, 5)
+	opts = append(opts, srvconn.WithUser(user))
+	opts = append(opts, srvconn.WithRemoteAddr(addr))
+	opts = append(opts, srvconn.WithLoginFrom(model.LoginFromSSH))
+	opts = append(opts, srvconn.WithTerminalCfg(&terminalCfg))
+	return &SftpHandler{
+		UserSftpConn: srvconn.NewUserSftpConn(s.jmsService, opts...),
+		recorder:     proxy.GetFTPFileRecorder(s.jmsService),
+	}
 }
 
 func (s *Server) LocalPortForwardingPermission(ctx ssh.Context, dstHost string, dstPort uint32) bool {
@@ -151,7 +174,7 @@ func (s *Server) SessionHandler(sess ssh.Session) {
 	}
 	termConf := s.GetTerminalConfig()
 	directReq := sess.Context().Value(auth.ContextKeyDirectLoginFormat)
-	if pty, winChan, isPty := sess.Pty(); isPty {
+	if pty, winChan, isPty := sess.Pty(); isPty && sess.RawCommand() == "" {
 		if directRequest, ok3 := directReq.(*auth.DirectLoginAssetReq); ok3 {
 			selectedAssets, err := s.getMatchedAssetsByDirectReq(user, directRequest)
 			if err != nil {
@@ -201,8 +224,16 @@ func (s *Server) SessionHandler(sess ssh.Session) {
 			logger.Error(msg)
 			return
 		}
+		permAssetDetail, err := s.jmsService.GetUserPermAssetDetailById(user.ID, selectedAssets[0].ID)
+		if err != nil {
+			msg := fmt.Sprintf(i18n.T("Must be unique asset for %s"), directRequest.AssetTarget)
+			utils.IgnoreErrWriteString(sess, msg)
+			logger.Errorf("Get permAssetDetail failed: %s", err)
+			return
+		}
+
 		matchedProtocol := directRequest.Protocol == model.ProtocolSSH
-		assetSupportedSSH := selectedAssets[0].IsSupportProtocol(model.ProtocolSSH)
+		assetSupportedSSH := permAssetDetail.SupportProtocol(model.ProtocolSSH)
 		if !matchedProtocol || !assetSupportedSSH {
 			msg := "not ssh asset connection"
 			utils.IgnoreErrWriteString(sess, msg)
@@ -210,7 +241,7 @@ func (s *Server) SessionHandler(sess ssh.Session) {
 			return
 		}
 
-		selectAccounts, err := s.getMatchedAccounts(user, directRequest, selectedAssets[0])
+		selectAccounts, err := s.getMatchedAccounts(user, directRequest, permAssetDetail)
 		if err != nil {
 			logger.Error(err)
 			utils.IgnoreErrWriteString(sess, err.Error())
@@ -236,15 +267,17 @@ func (s *Server) SessionHandler(sess ssh.Session) {
 
 }
 
-func (s *Server) proxyDirectRequest(sess ssh.Session, user *model.User, asset model.Asset,
+func (s *Server) proxyDirectRequest(sess ssh.Session, user *model.User, asset model.PermAsset,
 	permAccount model.PermAccount) {
 	//  仅支持 ssh 的协议资产
+	remoteAddr, _, _ := net.SplitHostPort(sess.RemoteAddr().String())
 	req := &service.SuperConnectTokenReq{
 		UserId:        user.ID,
 		AssetId:       asset.ID,
 		Account:       permAccount.Alias,
 		Protocol:      model.ProtocolSSH,
 		ConnectMethod: model.ProtocolSSH,
+		RemoteAddr:    remoteAddr,
 	}
 	// ssh 非交互式的直连格式，不支持资产的登录复核
 	tokenInfo, err := s.jmsService.CreateSuperConnectToken(req)
@@ -265,19 +298,19 @@ func (s *Server) proxyDirectRequest(sess ssh.Session, user *model.User, asset mo
 	s.proxyTokenInfo(sess, &connectToken)
 }
 
-func (s *Server) proxyTokenInfo(sess ssh.Session, tokeInfo *model.ConnectToken) {
+func (s *Server) proxyTokenInfo(sess ssh.Session, tokenInfo *model.ConnectToken) {
 	ctxId, ok := sess.Context().Value(ctxID).(string)
 	if !ok {
 		logger.Error("Not found ctxID")
 		utils.IgnoreErrWriteString(sess, "not found ctx id")
 		return
 	}
-	asset := tokeInfo.Asset
-	account := tokeInfo.Account
+	asset := tokenInfo.Asset
+	account := tokenInfo.Account
 	var gateways []model.Gateway
 	// todo：domain
-	if tokeInfo.Gateway != nil {
-		gateways = []model.Gateway{*tokeInfo.Gateway}
+	if tokenInfo.Gateway != nil {
+		gateways = []model.Gateway{*tokenInfo.Gateway}
 	}
 
 	sshAuthOpts := buildSSHClientOptions(&asset, &account, gateways)
@@ -287,17 +320,24 @@ func (s *Server) proxyTokenInfo(sess ssh.Session, tokeInfo *model.ConnectToken) 
 		utils.IgnoreErrWriteString(sess, err.Error())
 		return
 	}
-	defer sshClient.Close()
+	//defer sshClient.Close()
 	vsReq := &vscodeReq{
 		reqId:      ctxId,
-		user:       &tokeInfo.User,
+		user:       &tokenInfo.User,
 		client:     sshClient,
-		expireInfo: tokeInfo.ExpireAt,
+		expireInfo: tokenInfo.ExpireAt,
+		forwards:   make(map[string]net.Listener),
 	}
-	s.addVSCodeReq(vsReq)
-	defer s.deleteVSCodeReq(vsReq)
+
+	go func() {
+		s.addVSCodeReq(vsReq)
+		defer s.deleteVSCodeReq(vsReq)
+		<-sess.Context().Done()
+		_ = sshClient.Close()
+		logger.Infof("User %s end vscode request %s", vsReq.user, sshClient)
+	}()
 	if len(sess.Command()) != 0 {
-		s.proxyAssetCommand(sess, sshClient, tokeInfo)
+		s.proxyAssetCommand(sess, sshClient, tokenInfo)
 		return
 	}
 
@@ -306,25 +346,47 @@ func (s *Server) proxyTokenInfo(sess ssh.Session, tokeInfo *model.ConnectToken) 
 		return
 	}
 
-	if err = s.proxyVscodeShell(sess, vsReq, sshClient, tokeInfo); err != nil {
+	if err = s.proxyVscodeShell(sess, vsReq, sshClient, tokenInfo); err != nil {
 		utils.IgnoreErrWriteString(sess, err.Error())
 	}
 }
 
+func IsScpCommand(rawStr string) bool {
+	rawCommands := strings.Split(rawStr, ";")
+	for _, cmd := range rawCommands {
+		cmd = strings.TrimSpace(cmd)
+		if strings.HasPrefix(cmd, "scp") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) recordSessionLifecycle(sid string, event model.LifecycleEvent, reason string) {
+	logObj := model.SessionLifecycleLog{Reason: reason}
+	if err2 := s.jmsService.RecordSessionLifecycleLog(sid, event, logObj); err2 != nil {
+		logger.Errorf("Record session %s lifecycle %s failed: %s", sid, event, err2)
+	}
+}
+
 func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClient,
-	tokeInfo *model.ConnectToken) {
+	tokenInfo *model.ConnectToken) {
 	rawStr := sess.RawCommand()
-	if strings.HasPrefix(rawStr, "scp") && !config.GetConf().EnableVscodeSupport {
-		logger.Errorf("Not support scp command: %s", rawStr)
-		utils.IgnoreErrWriteString(sess, "Not support scp command")
-		return
-	} else {
+	if IsScpCommand(rawStr) {
+		if !config.GetConf().EnableVscodeSupport {
+			logger.Errorf("Not support scp command: %s", rawStr)
+			utils.IgnoreErrWriteString(sess, "Not support scp command")
+			return
+		}
 		// 开启了 vscode 支持，放开使用 scp 命令传输文件
 		// todo: 解析 scp 数据包，获取文件信息
 		logger.Infof("Execute scp command: %s", rawStr)
+	} else {
+		logger.Infof("Execute command: %s", rawStr)
 	}
+
 	// todo: 暂且不支持 acl 工单
-	acls := tokeInfo.CommandFilterACLs
+	acls := tokenInfo.CommandFilterACLs
 	for i := range acls {
 		acl := acls[i]
 		_, action, _ := acl.Match(rawStr)
@@ -342,7 +404,7 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 	}
 
 	host, _, _ := net.SplitHostPort(sess.RemoteAddr().String())
-	reqSession := tokeInfo.CreateSession(host, model.LoginFromSSH, model.COMMANDType)
+	reqSession := tokenInfo.CreateSession(host, model.LoginFromSSH, model.COMMANDType)
 	respSession, err := s.jmsService.CreateSession(reqSession)
 	if err != nil {
 		logger.Errorf("Create command session err: %s", err)
@@ -350,11 +412,22 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 	}
 	ctx, cancel := context.WithCancel(sess.Context())
 	defer cancel()
+	respSession.TokenId = tokenInfo.Id
 	traceSession := session.NewSession(&respSession, func(task *model.TerminalTask) error {
 		switch task.Name {
 		case model.TaskKillSession:
 			cancel()
+			logger.Infof("User %s end command request %s as task kill_session",
+				tokenInfo.User.String(), sshClient)
 			return nil
+		case model.TaskPermExpired:
+			cancel()
+			logger.Infof("User %s end command request %s as task permission has expired",
+				tokenInfo.User.String(), sshClient)
+			return nil
+		case model.TaskPermValid:
+			return nil
+
 		}
 		return fmt.Errorf("ssh proxy not support task: %s", task.Name)
 	})
@@ -362,7 +435,7 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 
 	defer func() {
 		if err2 := s.jmsService.SessionFinished(respSession.ID, modelCommon.NewNowUTCTime()); err2 != nil {
-			logger.Errorf("Create tunnel session err: %s", err)
+			logger.Errorf("Create tunnel session err: %s", err2)
 		}
 		session.RemoveSession(traceSession)
 	}()
@@ -372,12 +445,29 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 		logger.Errorf("Get SSH session failed: %s", err)
 		return
 	}
+	s.recordSessionLifecycle(respSession.ID, model.AssetConnectSuccess, "")
 	defer goSess.Close()
 	defer sshClient.ReleaseSession(goSess)
 	go func() {
 		<-ctx.Done()
 		_ = goSess.Close()
 	}()
+
+	// to fix this issue: https://github.com/ploxiln/fab-classic/issues/46
+	// make pty for client when client required or command is login shell
+	if pty, _, isPty := sess.Pty(); isPty ||
+		(strings.Contains(rawStr, "bash --login") || strings.Contains(rawStr, "bash -l")) {
+		_ = goSess.RequestPty(
+			pty.Term,
+			pty.Window.Width,
+			pty.Window.Height,
+			gossh.TerminalModes{
+				gossh.ECHO:          1,     // enable echoing
+				gossh.TTY_OP_ISPEED: 14400, // input speed = 14.4 kbaud
+				gossh.TTY_OP_OSPEED: 14400, // output speed = 14.4 kbaud
+			},
+		)
+	}
 
 	goSess.Stdin = sess
 	out, err := goSess.StdoutPipe()
@@ -407,9 +497,9 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 		}
 		buf := make([]byte, 1024)
 		for {
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err != io.EOF {
+			n, err1 := reader.Read(buf)
+			if err1 != nil {
+				if err1 != io.EOF {
 					logger.Errorf("Read ssh session output failed: %s", err)
 				} else {
 					logger.Info("Read ssh command session output end")
@@ -432,14 +522,16 @@ func (s *Server) proxyAssetCommand(sess ssh.Session, sshClient *srvconn.SSHClien
 	err = goSess.Run(rawStr)
 	if err != nil {
 		logger.Errorf("User %s Run command %s failed: %s",
-			tokeInfo.User.String(), rawStr, err)
+			tokenInfo.User.String(), rawStr, err)
 	}
+	reason := string(model.ReasonErrConnectDisconnect)
+	s.recordSessionLifecycle(respSession.ID, model.AssetConnectFinished, reason)
 }
 
 func (s *Server) proxyVscodeShell(sess ssh.Session, vsReq *vscodeReq, sshClient *srvconn.SSHClient,
-	tokeInfo *model.ConnectToken) error {
+	tokenInfo *model.ConnectToken) error {
 	host, _, _ := net.SplitHostPort(sess.RemoteAddr().String())
-	reqSession := tokeInfo.CreateSession(host, model.LoginFromSSH, model.TUNNELType)
+	reqSession := tokenInfo.CreateSession(host, model.LoginFromSSH, model.TUNNELType)
 	respSession, err := s.jmsService.CreateSession(reqSession)
 	if err != nil {
 		logger.Errorf("Create tunnel session err: %s", err)
@@ -452,14 +544,22 @@ func (s *Server) proxyVscodeShell(sess ssh.Session, vsReq *vscodeReq, sshClient 
 		switch task.Name {
 		case model.TaskKillSession:
 			cancel()
+			logger.Infof("User %s end vscode request %s as task kill_session", vsReq.user, sshClient)
 			return nil
+		case model.TaskPermExpired:
+			cancel()
+			logger.Infof("User %s end vscode request %s as permission has expired", vsReq.user, sshClient)
+			return nil
+		case model.TaskPermValid:
+			return nil
+
 		}
 		return fmt.Errorf("ssh proxy not support task: %s", task.Name)
 	})
 	session.AddSession(traceSession)
 	defer func() {
 		if err2 := s.jmsService.SessionFinished(respSession.ID, modelCommon.NewNowUTCTime()); err2 != nil {
-			logger.Errorf("Create tunnel session err: %s", err)
+			logger.Errorf("Create tunnel session err: %s", err2)
 		}
 		session.RemoveSession(traceSession)
 	}()
@@ -469,7 +569,7 @@ func (s *Server) proxyVscodeShell(sess ssh.Session, vsReq *vscodeReq, sshClient 
 		logger.Errorf("Get SSH session failed: %s", err)
 		return err
 	}
-
+	s.recordSessionLifecycle(respSession.ID, model.AssetConnectSuccess, "")
 	defer goSess.Close()
 	defer sshClient.ReleaseSession(goSess)
 	stdOut, err := goSess.StdoutPipe()
@@ -485,6 +585,7 @@ func (s *Server) proxyVscodeShell(sess ssh.Session, vsReq *vscodeReq, sshClient 
 	err = goSess.Shell()
 	if err != nil {
 		logger.Errorf("Get SSH session shell failed: %s", err)
+		s.recordSessionLifecycle(respSession.ID, model.AssetConnectFinished, err.Error())
 		return err
 	}
 	logger.Infof("User %s start vscode request to %s", vsReq.user, sshClient)
@@ -504,11 +605,15 @@ func (s *Server) proxyVscodeShell(sess ssh.Session, vsReq *vscodeReq, sshClient 
 		case <-ctx.Done():
 			logger.Infof("SSH conn[%s] User %s end vscode request %s as session done",
 				vsReq.reqId, vsReq.user, sshClient)
+			reason := string(model.ReasonErrConnectDisconnect)
+			s.recordSessionLifecycle(respSession.ID, model.AssetConnectFinished, reason)
 			return nil
 		case now := <-ticker.C:
 			if vsReq.expireInfo.IsExpired(now) {
 				logger.Infof("SSH conn[%s] User %s end vscode request %s as permission has expired",
 					vsReq.reqId, vsReq.user, sshClient)
+				reason := string(model.ReasonErrPermissionExpired)
+				s.recordSessionLifecycle(respSession.ID, model.AssetConnectFinished, reason)
 				return nil
 			}
 			logger.Debugf("SSH conn[%s] user %s vscode request still alive", vsReq.reqId, vsReq.user)
@@ -558,14 +663,14 @@ func buildSSHClientOptions(asset *model.Asset, account *model.Account,
 	return sshAuthOpts
 }
 
-func (s *Server) getMatchedAssetsByDirectReq(user *model.User, req *auth.DirectLoginAssetReq) ([]model.Asset, error) {
-	var getUserPermAssets func() ([]model.Asset, error)
+func (s *Server) getMatchedAssetsByDirectReq(user *model.User, req *auth.DirectLoginAssetReq) ([]model.PermAsset, error) {
+	var getUserPermAssets func() ([]model.PermAsset, error)
 	if common.ValidUUIDString(req.AssetTarget) {
-		getUserPermAssets = func() ([]model.Asset, error) {
+		getUserPermAssets = func() ([]model.PermAsset, error) {
 			return s.jmsService.GetUserPermAssetById(user.ID, req.AssetTarget)
 		}
 	} else {
-		getUserPermAssets = func() ([]model.Asset, error) {
+		getUserPermAssets = func() ([]model.PermAsset, error) {
 			return s.jmsService.GetUserPermAssetsByIP(user.ID, req.AssetTarget)
 		}
 	}
@@ -578,28 +683,12 @@ func (s *Server) getMatchedAssetsByDirectReq(user *model.User, req *auth.DirectL
 		logger.Infof("User %s no perm for asset %s", user.String(), req.AssetTarget)
 		return nil, fmt.Errorf("match asset failed: %s", i18n.T("No found asset"))
 	}
-
-	matched := make([]model.Asset, 0, len(assets))
-	for i := range assets {
-		if assets[i].IsSupportProtocol(req.Protocol) {
-			matched = append(matched, assets[i])
-		}
-	}
-	if len(matched) == 0 {
-		logger.Infof("Asset %s do not support %s protocol", req.AssetTarget, req.Protocol)
-		return nil, fmt.Errorf("match asset failed: %s", i18n.T("No found ssh protocol supported"))
-	}
-	return matched, nil
+	return assets, nil
 }
 
 func (s *Server) getMatchedAccounts(user *model.User, req *auth.DirectLoginAssetReq,
-	asset model.Asset) ([]model.PermAccount, error) {
-	accounts, err := s.jmsService.GetAccountsByUserIdAndAssetId(user.ID, asset.ID)
-	if err != nil {
-		logger.Errorf("Get account failed: %s", err)
-		return nil, err
-	}
-	matched := GetMatchedAccounts(accounts, req.AccountUsername)
+	permAssetDetail model.PermAssetDetail) ([]model.PermAccount, error) {
+	matched := GetMatchedAccounts(permAssetDetail.PermedAccounts, req.AccountUsername)
 	return matched, nil
 }
 
@@ -613,4 +702,81 @@ func buildDirectRequestOptions(user *model.User, directRequest *auth.DirectLogin
 		opts = append(opts, DirectConnectToken(directRequest.ConnectToken))
 	}
 	return opts
+}
+
+func (s *Server) buildConnectToken(ctx ssh.Context, user *model.User, req *auth.DirectLoginAssetReq) (*model.ConnectToken, error) {
+	selectedAssets, err := s.getMatchedAssetsByDirectReq(user, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(selectedAssets) != 1 {
+		msg := fmt.Sprintf(i18n.T("Must be unique asset for %s"), req.AssetTarget)
+		return nil, errors.New(msg)
+	}
+	permAssetDetail, err := s.jmsService.GetUserPermAssetDetailById(user.ID, selectedAssets[0].ID)
+	if err != nil {
+		msg := fmt.Sprintf(i18n.T("Must be unique asset for %s"), req.AssetTarget)
+		logger.Errorf("Get permAssetDetail failed: %s", err)
+		return nil, errors.New(msg)
+	}
+
+	matchedProtocol := req.Protocol == model.ProtocolSSH
+	assetSupportedSSH := permAssetDetail.SupportProtocol(model.ProtocolSSH)
+	if !matchedProtocol || !assetSupportedSSH {
+		msg := "not ssh asset connection"
+		logger.Errorf("Direct Request ssh failed: %s", msg)
+		return nil, errors.New(msg)
+	}
+
+	selectAccounts, err := s.getMatchedAccounts(user, req, permAssetDetail)
+	if err != nil {
+		return nil, err
+	}
+	if len(selectAccounts) != 1 {
+		msg := fmt.Sprintf(i18n.T("Must be unique account for %s"), req.AccountUsername)
+		logger.Error(msg)
+		return nil, errors.New(msg)
+	}
+	selectAccount := selectAccounts[0]
+	remoteAddr, _, _ := net.SplitHostPort(ctx.RemoteAddr().String())
+	sessReq := &service.SuperConnectTokenReq{
+		UserId:        user.ID,
+		AssetId:       permAssetDetail.ID,
+		Account:       selectAccount.Alias,
+		Protocol:      model.ProtocolSSH,
+		ConnectMethod: model.ProtocolSSH,
+		RemoteAddr:    remoteAddr,
+	}
+	// ssh 非交互式的直连格式，不支持资产的登录复核
+	tokenInfo, err := s.jmsService.CreateSuperConnectToken(sessReq)
+	if err != nil {
+		msg := err.Error()
+		if tokenInfo.Detail != "" {
+			msg = tokenInfo.Detail
+		}
+		logger.Errorf("Create super connect token failed: %s", msg)
+		return nil, err
+	}
+	connectToken, err := s.jmsService.GetConnectTokenInfo(tokenInfo.ID)
+	if err != nil {
+		logger.Errorf("Create super connect token err: %s", err)
+		return nil, err
+	}
+	return &connectToken, nil
+}
+
+func (s *Server) buildSSHClient(tokenInfo *model.ConnectToken) (*srvconn.SSHClient, error) {
+	asset := tokenInfo.Asset
+	account := tokenInfo.Account
+	var gateways []model.Gateway
+	if tokenInfo.Gateway != nil {
+		gateways = []model.Gateway{*tokenInfo.Gateway}
+	}
+	sshAuthOpts := buildSSHClientOptions(&asset, &account, gateways)
+	sshClient, err := srvconn.NewSSHClient(sshAuthOpts...)
+	if err != nil {
+		logger.Errorf("Get SSH Client failed: %s", err)
+		return sshClient, err
+	}
+	return sshClient, nil
 }

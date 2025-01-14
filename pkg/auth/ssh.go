@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"errors"
 	"net"
 	"strings"
 
 	"github.com/gliderlabs/ssh"
+	"github.com/jumpserver/koko/pkg/cache"
+	"github.com/jumpserver/koko/pkg/config"
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -12,84 +15,93 @@ import (
 	"github.com/jumpserver/koko/pkg/logger"
 )
 
-type SSHAuthFunc func(ctx ssh.Context, password, publicKey string) (res ssh.AuthResult)
+var authErr = errors.New("auth failed")
+
+type SSHAuthFunc func(ctx ssh.Context, password, publicKey string) error
 
 func SSHPasswordAndPublicKeyAuth(jmsService *service.JMService) SSHAuthFunc {
-	return func(ctx ssh.Context, password, publicKey string) (res ssh.AuthResult) {
+	return func(ctx ssh.Context, password, publicKey string) error {
+		if password == "" && publicKey == "" {
+			logger.Errorf("SSH conn[%s] no password and publickey", ctx.SessionID())
+			return authErr
+		}
 		remoteAddr, _, _ := net.SplitHostPort(ctx.RemoteAddr().String())
 		username := ctx.User()
 		if req, ok := parseDirectLoginReq(jmsService, ctx); ok {
-			if req.IsToken() && req.Authenticate(password) {
-				ctx.SetValue(ContextKeyUser, &req.ConnectToken.User)
-				logger.Infof("SSH conn[%s] %s for %s from %s", ctx.SessionID(),
-					actionAccepted, username, remoteAddr)
-				return ssh.AuthSuccessful
+			if req.IsToken() {
+				if req.Authenticate(password) {
+					ctx.SetValue(ContextKeyUser, &req.ConnectToken.User)
+					logger.Infof("SSH conn[%s] %s for %s from %s", ctx.SessionID(),
+						actionAccepted, username, remoteAddr)
+					return nil
+				} else {
+					logger.Errorf("SSH conn[%s] token %s auth failed", ctx.SessionID(), req.ConnectToken.Id)
+					return authErr
+				}
 			}
 			username = req.User()
 		}
 		authMethod := "publickey"
 		action := actionAccepted
-		res = ssh.AuthFailed
+		var res error
 		if password != "" {
 			authMethod = "password"
 		}
-		userAuthClient, ok := ctx.Value(ContextKeyClient).(*UserAuthClient)
-		if !ok {
-			newClient := jmsService.CloneClient()
-
-			userClient := service.NewUserClient(
-				service.UserClientUsername(username),
-				service.UserClientRemoteAddr(remoteAddr),
-				service.UserClientLoginType("T"),
-				service.UserClientHttpClient(&newClient),
-			)
-			userAuthClient = &UserAuthClient{
-				UserClient:  userClient,
-				authOptions: make(map[string]authOptions),
-			}
-			ctx.SetValue(ContextKeyClient, userAuthClient)
+		newClient := jmsService.CloneClient()
+		var accessKey model.AccessKey
+		conf := config.GetConf()
+		_ = accessKey.LoadFromFile(conf.AccessKeyFilePath)
+		userClient := service.NewUserClient(
+			service.UserClientUsername(username),
+			service.UserClientRemoteAddr(remoteAddr),
+			service.UserClientLoginType("T"),
+			service.UserClientHttpClient(&newClient),
+			service.UserClientSvcSignKey(accessKey),
+			service.UserClientPassword(password),
+			service.UserClientPublicKey(publicKey),
+		)
+		userAuthClient := &UserAuthClient{
+			UserClient:  userClient,
+			authOptions: make(map[string]authOptions),
 		}
-		userAuthClient.SetOption(service.UserClientPassword(password),
-			service.UserClientPublicKey(publicKey))
+		ctx.SetValue(ContextKeyClient, userAuthClient)
 		logger.Infof("SSH conn[%s] authenticating user %s %s", ctx.SessionID(), username, authMethod)
 		user, authStatus := userAuthClient.Authenticate(ctx)
 		switch authStatus {
-		case authMFARequired:
-			action = actionPartialAccepted
-			res = ssh.AuthPartiallySuccessful
-			ctx.SetValue(ContextKeyAuthStatus, authMFARequired)
 		case authSuccess:
-			res = ssh.AuthSuccessful
 			ctx.SetValue(ContextKeyUser, &user)
-		case authConfirmRequired:
+		case authConfirmRequired, authMFARequired:
 			action = actionPartialAccepted
-			res = ssh.AuthPartiallySuccessful
-			ctx.SetValue(ContextKeyAuthStatus, authConfirmRequired)
+			ctx.SetValue(ContextKeyAuthStatus, authStatus)
+			res = &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{
+				KeyboardInteractiveCallback: SSHKeyboardInteractiveAuth,
+			}}
 		default:
 			action = actionFailed
+			res = authErr
 		}
 		logger.Infof("SSH conn[%s] %s %s for %s from %s", ctx.SessionID(),
 			action, authMethod, username, remoteAddr)
-		return
+		return res
 	}
 }
 
-func SSHKeyboardInteractiveAuth(ctx ssh.Context, challenger gossh.KeyboardInteractiveChallenge) (res ssh.AuthResult) {
+func SSHKeyboardInteractiveAuth(ctx ssh.Context, challenger gossh.KeyboardInteractiveChallenge) error {
 	if value, ok := ctx.Value(ContextKeyAuthFailed).(*bool); ok && *value {
-		return ssh.AuthFailed
+		return authErr
 	}
+
 	username := GetUsernameFromSSHCtx(ctx)
-	res = ssh.AuthFailed
 	client, ok := ctx.Value(ContextKeyClient).(*UserAuthClient)
 	if !ok {
 		logger.Errorf("SSH conn[%s] user %s Mfa Auth failed: not found session client.",
 			ctx.SessionID(), username)
-		return
+		return authErr
 	}
 	status, ok2 := ctx.Value(ContextKeyAuthStatus).(StatusAuth)
 	if !ok2 {
 		logger.Errorf("SSH conn[%s] user %s unknown auth", ctx.SessionID(), username)
-		return
+		return authErr
 	}
 	var checkAuth func(ssh.Context, gossh.KeyboardInteractiveChallenge) bool
 	switch status {
@@ -97,11 +109,13 @@ func SSHKeyboardInteractiveAuth(ctx ssh.Context, challenger gossh.KeyboardIntera
 		checkAuth = client.CheckConfirmAuth
 	case authMFARequired:
 		checkAuth = client.CheckMFAAuth
+	default:
+		return authErr
 	}
 	if checkAuth != nil && checkAuth(ctx, challenger) {
-		res = ssh.AuthSuccessful
+		return nil
 	}
-	return
+	return authErr
 }
 
 const (
@@ -218,6 +232,12 @@ func parseDirectLoginReq(jmsService *service.JMService, ctx ssh.Context) (*Direc
 func parseJMSTokenLoginReq(jmsService *service.JMService, ctx ssh.Context) (*DirectLoginAssetReq, bool) {
 	if strings.HasPrefix(ctx.User(), tokenPrefix) {
 		token := strings.TrimPrefix(ctx.User(), tokenPrefix)
+		key := cache.CreateAddrCacheKey(ctx.RemoteAddr(), token)
+		if connectToken := cache.TokenCacheInstance.Get(key); connectToken != nil {
+			req := DirectLoginAssetReq{ConnectToken: connectToken,
+				Protocol: connectToken.Protocol}
+			return &req, true
+		}
 		if connectToken, err := jmsService.GetConnectTokenInfo(token); err == nil {
 			req := DirectLoginAssetReq{ConnectToken: &connectToken,
 				Protocol: connectToken.Protocol}

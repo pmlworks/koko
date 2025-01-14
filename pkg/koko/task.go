@@ -43,6 +43,20 @@ func uploadRemainReplay(jmsService *service.JMService) {
 		return nil
 	})
 
+	recordLifecycleLog := func(id string, event model.LifecycleEvent, reason string) {
+		logObj := model.SessionLifecycleLog{Reason: reason}
+		if err1 := jmsService.RecordSessionLifecycleLog(id, event, logObj); err1 != nil {
+			logger.Errorf("Update session %s activity log failed: %s", id, err1)
+		}
+	}
+	if len(allRemainFiles) == 0 {
+		logger.Info("No remain replay file to upload")
+		return
+	}
+
+	logger.Infof("Start upload remain %d replay files 10 min later ", len(allRemainFiles))
+	time.Sleep(10 * time.Minute)
+
 	for absPath, remainReplay := range allRemainFiles {
 		absGzPath := absPath
 		if !remainReplay.IsGzip {
@@ -64,14 +78,23 @@ func uploadRemainReplay(jmsService *service.JMService) {
 			}
 			_ = os.Remove(absPath)
 		}
-		Target, _ := filepath.Rel(replayDir, absGzPath)
+		target, _ := filepath.Rel(replayDir, absGzPath)
+
+		recordLifecycleLog(remainReplay.Id, model.ReplayUploadStart, "")
 		logger.Infof("Upload replay file: %s, type: %s", absGzPath, replayStorage.TypeName())
-		if err2 := replayStorage.Upload(absGzPath, Target); err2 != nil {
+		if err2 := replayStorage.Upload(absGzPath, target); err2 != nil {
 			logger.Errorf("Upload remain replay file %s failed: %s", absGzPath, err2)
+			reason := model.SessionReplayErrUploadFailed
+			if err3 := jmsService.SessionReplayFailed(remainReplay.Id, reason); err3 != nil {
+				logger.Errorf("Update session %s status %s failed: %s", remainReplay.Id, reason, err3)
+			}
+			failureMsg := strings.ReplaceAll(err2.Error(), ",", " ")
+			recordLifecycleLog(remainReplay.Id, model.ReplayUploadFailure, failureMsg)
 			continue
 		}
-		if err := jmsService.FinishReply(remainReplay.Id); err != nil {
-			logger.Errorf("Notify session %s upload failed: %s", remainReplay.Id, err)
+		recordLifecycleLog(remainReplay.Id, model.ReplayUploadSuccess, "")
+		if err1 := jmsService.FinishReply(remainReplay.Id); err1 != nil {
+			logger.Errorf("Notify session %s upload failed: %s", remainReplay.Id, err1)
 			continue
 		}
 		_ = os.Remove(absGzPath)
@@ -99,6 +122,12 @@ func uploadRemainFTPFile(jmsService *service.JMService) {
 		}
 		return nil
 	})
+	if len(allRemainFiles) == 0 {
+		logger.Info("No remain ftp file to upload")
+		return
+	}
+	logger.Infof("Start upload remain %d ftp files 10 min later ", len(allRemainFiles))
+	time.Sleep(10 * time.Minute)
 
 	for absPath, remainFTPFile := range allRemainFiles {
 		absGzPath := absPath
@@ -206,13 +235,13 @@ func KeepWsHeartbeat(jmsService *service.JMService) {
 }
 
 func GetStatusData() interface{} {
-	sessions := session.GetAliveSessions()
+	ids := session.GetAliveSessionIds()
 	payload := model.HeartbeatData{
-		SessionOnlineIds: sessions,
+		SessionOnlineIds: ids,
 		CpuUsed:          common.CpuLoad1Usage(),
 		MemoryUsed:       common.MemoryUsagePercent(),
 		DiskUsed:         common.DiskUsagePercent(),
-		SessionOnline:    len(sessions),
+		SessionOnline:    len(ids),
 	}
 	return map[string]interface{}{
 		"type":    "status",

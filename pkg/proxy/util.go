@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
@@ -88,10 +89,7 @@ func GetStorage(conf *model.TerminalConfig) Storage {
 		secretKey = cfg.SecretKey
 
 		if region == "" && endpoint != "" {
-			endpointArray := strings.Split(endpoint, ".")
-			if len(endpointArray) >= 2 {
-				region = endpointArray[1]
-			}
+			region = ParseEndpointRegion(endpoint)
 		}
 		if bucket == "" {
 			bucket = "jumpserver"
@@ -191,9 +189,73 @@ func NewCommandStorage(jmsService *service.JMService, conf *model.TerminalConfig
 			IsDataStream:       isDataStream,
 			InsecureSkipVerify: skipVerify,
 		}
+	case "influxdb":
+		var (
+			serverURL   string
+			authToken   string
+			bucket      string
+			measurement string
+		)
+		if sURL, ok1 := cf["SERVER_URL"].(string); ok1 {
+			serverURL = sURL
+		}
+		if token, ok1 := cf["AUTH_TOKEN"].(string); ok1 {
+			authToken = token
+		}
+		if bucketValue, ok1 := cf["BUCKET"].(string); ok1 {
+			bucket = bucketValue
+		}
+		if measurementValue, ok1 := cf["MEASUREMENT"].(string); ok1 {
+			measurement = measurementValue
+		}
+		if bucket == "" {
+			bucket = "jumpserver"
+		}
+		if measurement == "" {
+			measurement = "commands"
+		}
+		return storage.InfluxdbStorage{
+			ServerURL:   serverURL,
+			AuthToken:   authToken,
+			Bucket:      bucket,
+			Measurement: measurement,
+		}
+
 	case "null":
 		return storage.NewNullStorage()
 	default:
 		return storage.ServerStorage{StorageType: "server", JmsService: jmsService}
 	}
 }
+
+func ParseEndpointRegion(s string) string {
+	if strings.Contains(s, amazonawsSuffix) {
+		return ParseAWSURLRegion(s)
+	}
+	endpoint, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	endpoints := strings.Split(endpoint.Hostname(), ".")
+	if len(endpoints) >= 3 {
+		return endpoints[len(endpoints)-3]
+	}
+	return endpoints[0]
+}
+
+func ParseAWSURLRegion(s string) string {
+	endpoint, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	s = endpoint.Hostname()
+	s = strings.TrimSuffix(s, amazonawsCNSuffix)
+	s = strings.TrimSuffix(s, amazonawsSuffix)
+	regions := strings.Split(s, ".")
+	return regions[len(regions)-1]
+}
+
+const (
+	amazonawsCNSuffix = ".amazonaws.com.cn"
+	amazonawsSuffix   = ".amazonaws.com"
+)

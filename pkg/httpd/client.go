@@ -1,10 +1,12 @@
 package httpd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 
@@ -20,6 +22,16 @@ type Client struct {
 	pty       ssh.Pty
 
 	sync.Mutex
+
+	// 用于防抖处理
+	buffer      bytes.Buffer
+	bufferMutex sync.Mutex
+	timer       *time.Timer
+
+	KubernetesId string
+	Namespace    string
+	Pod          string
+	Container    string
 }
 
 func (c *Client) WinCh() <-chan ssh.Window {
@@ -40,14 +52,59 @@ func (c *Client) Read(p []byte) (n int, err error) {
 	return c.UserRead.Read(p)
 }
 
+// 向客户端发送数据进行1毫秒的防抖处理
 func (c *Client) Write(p []byte) (n int, err error) {
+	category := ""
+	connectToken := c.Conn.ConnectToken
+	if connectToken != nil {
+		category = connectToken.Platform.Category.Value
+	}
+
+	if category == "database" {
+		c.bufferMutex.Lock()
+		c.buffer.Write(p)
+		c.bufferMutex.Unlock()
+
+		if c.timer == nil {
+			c.timer = time.AfterFunc(time.Millisecond, c.flushBuffer)
+		}
+		return len(p), nil
+
+	}
+
+	messageType := TerminalBinary
+	if c.KubernetesId != "" {
+		messageType = TerminalK8SBinary
+	}
+
 	msg := Message{
-		Id:   c.Conn.Uuid,
-		Type: TerminalBinary,
-		Raw:  p,
+		Id:           c.Conn.Uuid,
+		Type:         messageType,
+		Raw:          p,
+		KubernetesId: c.KubernetesId,
 	}
 	c.Conn.SendMessage(&msg)
 	return len(p), nil
+}
+
+func (c *Client) flushBuffer() {
+	c.bufferMutex.Lock()
+	defer c.bufferMutex.Unlock()
+
+	if c.buffer.Len() > 0 {
+		msg := Message{
+			Id:   c.Conn.Uuid,
+			Type: TerminalBinary,
+			Raw:  c.buffer.Bytes(),
+		}
+		c.Conn.SendMessage(&msg)
+		c.buffer.Reset()
+	}
+
+	if c.buffer.Len() == 0 && c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
 }
 
 func (c *Client) Pty() ssh.Pty {
@@ -126,14 +183,23 @@ func (c *Client) HandleRoomEvent(event string, roomMsg *exchange.RoomMessage) {
 		msgType = TerminalSessionResume
 		msgData = string(roomMsg.Body)
 		logger.Debugf("Resume terminal session : %+v", roomMsg)
+	case exchange.PermValidEvent:
+		msgType = TerminalPermValid
+		msgData = string(roomMsg.Body)
+		logger.Debugf("Terminal perm is valid : %+v", roomMsg)
+	case exchange.PermExpiredEvent:
+		msgType = TerminalPermExpired
+		msgData = string(roomMsg.Body)
+		logger.Debugf("Terminal perm is expired : %+v", roomMsg)
 	default:
 		logger.Infof("unsupported room msg %+v", roomMsg)
 		return
 	}
 	var msg = Message{
-		Id:   c.Conn.Uuid,
-		Type: msgType,
-		Data: msgData,
+		Id:           c.Conn.Uuid,
+		Type:         msgType,
+		Data:         msgData,
+		KubernetesId: c.KubernetesId,
 	}
 	c.Conn.SendMessage(&msg)
 }

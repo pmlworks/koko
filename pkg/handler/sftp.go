@@ -9,23 +9,10 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/jumpserver/koko/pkg/jms-sdk-go/model"
-	"github.com/jumpserver/koko/pkg/jms-sdk-go/service"
 	"github.com/jumpserver/koko/pkg/logger"
 	"github.com/jumpserver/koko/pkg/proxy"
 	"github.com/jumpserver/koko/pkg/srvconn"
 )
-
-func NewSFTPHandler(jmsService *service.JMService, user *model.User, addr string) *SftpHandler {
-	opts := make([]srvconn.UserSftpOption, 0, 5)
-	opts = append(opts, srvconn.WithUser(user))
-	opts = append(opts, srvconn.WithRemoteAddr(addr))
-	opts = append(opts, srvconn.WithLoginFrom(model.LoginFromSSH))
-	return &SftpHandler{
-		UserSftpConn: srvconn.NewUserSftpConn(jmsService, opts...),
-		recorder:     proxy.GetFTPFileRecorder(jmsService),
-	}
-}
 
 type SftpHandler struct {
 	*srvconn.UserSftpConn
@@ -66,15 +53,19 @@ func (s *SftpHandler) Filecmd(r *sftp.Request) (err error) {
 		logger.Debugf("%s=>%s", r.Filepath, r.Target)
 		return s.Rename(r.Filepath, r.Target)
 	case "Rmdir":
+		logger.Debug("Remove directory: ", r.Filepath)
 		err = s.RemoveDirectory(r.Filepath)
 	case "Remove":
+		logger.Debug("Remove: ", r.Filepath)
 		err = s.Remove(r.Filepath)
 	case "Mkdir":
+		logger.Debug("Mkdir: ", r.Filepath)
 		err = s.MkdirAll(r.Filepath)
 	case "Symlink":
 		logger.Debugf("%s=>%s", r.Filepath, r.Target)
 		err = s.Symlink(r.Filepath, r.Target)
 	default:
+		logger.Debug("Unsupported method: ", r.Method)
 		return
 	}
 	return
@@ -86,13 +77,24 @@ func (s *SftpHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	go func() {
 		<-r.Context().Done()
+
+		fileInfo, err2 := f.Stat()
+		if err2 != nil {
+			logger.Errorf("Get file %s stat err: %s", r.Filepath, err2)
+			return
+		}
+
+		if err1 := s.recorder.ChunkedRecord(f.FTPLog, f, 0, fileInfo.Size()); err1 != nil {
+			logger.Errorf("Record file %s err: %s", r.Filepath, err1)
+		}
+
 		if err := f.Close(); err != nil {
 			logger.Errorf("Remote sftp file %s close err: %s", r.Filepath, err)
 		}
 		logger.Infof("Sftp file write %s done", r.Filepath)
-		s.recorder.FinishFTPFile(f.FTPLog.ID)
 	}()
 	return NewWriterAt(f, s.recorder), err
 }
@@ -103,20 +105,27 @@ func (s *SftpHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err1 := s.recorder.Record(f.FTPLog, f); err1 != nil {
-		logger.Errorf("Record file %s err: %s", r.Filepath, err)
+
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-	// 重置文件指针
-	_, _ = f.Seek(0, io.SeekStart)
+
 	go func() {
 		<-r.Context().Done()
-		if err := f.Close(); err != nil {
-			logger.Errorf("Remote sftp file %s close err: %s", r.Filepath, err)
-		}
-		logger.Infof("Sftp File read %s done", r.Filepath)
 
+		if err1 := s.recorder.ChunkedRecord(f.FTPLog, f, 0, fileInfo.Size()); err1 != nil {
+			logger.Errorf("Record file %s err: %s", r.Filepath, err1)
+		}
+
+		if err2 := f.Close(); err2 != nil {
+			logger.Errorf("Remote sftp file %s close err: %s", r.Filepath, err2)
+		}
+
+		logger.Infof("Sftp File read %s done", r.Filepath)
 	}()
-	return f, err
+	// 包裹一层，兼容 WinSCP 目录的批量下载
+	return NewReaderAt(f), err
 }
 
 func (s *SftpHandler) Close() {
@@ -141,6 +150,10 @@ func NewWriterAt(f *srvconn.SftpFile, recorder *proxy.FTPFileRecorder) io.Writer
 	return &clientReadWritAt{f: f, mu: new(sync.RWMutex), recorder: recorder}
 }
 
+func NewReaderAt(f *srvconn.SftpFile) io.ReaderAt {
+	return &clientReadWritAt{f: f, mu: new(sync.RWMutex)}
+}
+
 type clientReadWritAt struct {
 	f  *srvconn.SftpFile
 	mu *sync.RWMutex
@@ -149,13 +162,11 @@ type clientReadWritAt struct {
 }
 
 func (c *clientReadWritAt) WriteAt(p []byte, off int64) (n int, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err1 := c.recorder.RecordFtpChunk(c.f.FTPLog, p, off); err1 != nil {
-		logger.Errorf("Record write err: %s", err1)
-	}
-	_, _ = c.f.Seek(off, 0)
-	return c.f.Write(p)
+	return c.f.WriteAt(p, off)
+}
+
+func (c *clientReadWritAt) ReadAt(p []byte, off int64) (n int, err error) {
+	return c.f.ReadAt(p, off)
 }
 
 type wrapperSFTPFileInfo struct {

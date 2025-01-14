@@ -55,7 +55,18 @@ type Config struct {
 	EnableLocalPortForward bool `mapstructure:"ENABLE_LOCAL_PORT_FORWARD"`
 	EnableVscodeSupport    bool `mapstructure:"ENABLE_VSCODE_SUPPORT"`
 
+	EnableReversePortForward bool `mapstructure:"ENABLE_REVERSE_PORT_FORWARD"`
+
 	HiddenFields []string `mapstructure:"HIDDEN_FIELDS"`
+
+	// 仅控制是否缓存 sftp 的 token 连接
+	ConnectionTokenReusable bool `mapstructure:"CONNECTION_TOKEN_REUSABLE"`
+
+	SshMaxSessions int `mapstructure:"SSH_MAX_SESSIONS"`
+
+	DisableInputAsCommand bool `mapstructure:"DISABLE_INPUT_AS_COMMAND"`
+
+	SecretEncryptKey string `mapstructure:"SECRET_ENCRYPT_KEY"`
 
 	RootPath          string
 	DataFolderPath    string
@@ -69,8 +80,12 @@ type Config struct {
 
 func (c *Config) EnsureConfigValid() {
 	if c.LanguageCode == "" {
-		c.LanguageCode = "zh"
+		c.LanguageCode = "en"
 	}
+}
+
+func (c *Config) UpdateRedisPassword(val string) {
+	c.RedisPassword = val
 }
 
 func GetConf() Config {
@@ -126,6 +141,7 @@ func getDefaultConfig() Config {
 		ReplayFolderPath:  replayFolderPath,
 		FTPFileFolderPath: ftpFileFolderPath,
 		CertsFolderPath:   CertsFolderPath,
+		LanguageCode:      "en",
 
 		Comment:             "KOKO",
 		UploadFailedReplay:  true,
@@ -144,6 +160,7 @@ func getDefaultConfig() Config {
 
 		EnableLocalPortForward: false,
 		EnableVscodeSupport:    false,
+		DisableInputAsCommand:  true,
 	}
 
 }

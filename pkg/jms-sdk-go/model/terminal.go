@@ -16,6 +16,10 @@ type TerminalConfig struct {
 	HostKey             string                 `json:"TERMINAL_HOST_KEY"`
 	EnableSessionShare  bool                   `json:"SECURITY_SESSION_SHARE"`
 	MaxStoreFTPFileSize int                    `json:"FTP_FILE_MAX_STORE"`
+	GptBaseUrl          string                 `json:"GPT_BASE_URL"`
+	GptApiKey           string                 `json:"GPT_API_KEY"`
+	GptProxy            string                 `json:"GPT_PROXY"`
+	GptModel            string                 `json:"GPT_MODEL"`
 }
 
 type Terminal struct {
@@ -29,11 +33,10 @@ type Terminal struct {
 }
 
 type TerminalTask struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Args       string     `json:"args"`
-	Kwargs     TaskKwargs `json:"kwargs"`
-	IsFinished bool
+	ID     string     `json:"id"`
+	Name   string     `json:"name"`
+	Args   string     `json:"args"`
+	Kwargs TaskKwargs `json:"kwargs"`
 }
 
 const (
@@ -41,6 +44,11 @@ const (
 
 	TaskLockSession   = "lock_session"
 	TaskUnlockSession = "unlock_session"
+
+	// TaskPermExpired TaskPermValid 非 api 数据，仅用于内部处理
+
+	TaskPermExpired = "perm_expired"
+	TaskPermValid   = "perm_valid"
 )
 
 type TaskKwargs struct {

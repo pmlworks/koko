@@ -6,12 +6,13 @@ const (
 	TerminalRegisterURL  = "/api/v1/terminal/terminal-registrations/" // 注册
 	TerminalConfigURL    = "/api/v1/terminal/terminals/config/"       // 获取配置
 	TerminalHeartBeatURL = "/api/v1/terminal/terminals/status/"
+
+	TerminalEncryptedConfigURL = "/api/v1/terminal/encrypted-config/"
 )
 
 // 用户登陆认证使用的API
 const (
-	TokenAssetURL      = "/api/v1/authentication/connection-token/%s/" // Token name
-	UserTokenAuthURL   = "/api/v1/authentication/tokens/"              // 用户登录验证
+	UserTokenAuthURL   = "/api/v1/authentication/tokens/" // 用户登录验证
 	UserConfirmAuthURL = "/api/v1/authentication/login-confirm-ticket/status/"
 	AuthMFASelectURL   = "/api/v1/authentication/mfa/select/" // 选择 MFA
 
@@ -28,6 +29,8 @@ const (
 	FTPLogListURL       = "/api/v1/audits/ftp-logs/" // 上传 ftp日志
 	FTPLogUpdateURL     = "/api/v1/audits/ftp-logs/%s/"
 	FTPLogFileURL       = "/api/v1/audits/ftp-logs/%s/upload/"
+
+	SessionLifecycleLogURL = "/api/v1/terminal/sessions/%s/lifecycle_log/"
 )
 
 // 授权相关API
@@ -70,10 +73,19 @@ const (
 	SuperConnectTokenSecretURL = "/api/v1/authentication/super-connection-token/secret/"
 	SuperConnectTokenInfoURL   = "/api/v1/authentication/super-connection-token/"
 
-	UserPermsAssetAccountsURL = "/api/v1/perms/users/%s/assets/%s/accounts/"
+	SuperConnectTokenCheckURL = "/api/v1/authentication/super-connection-token/%s/check/"
+
+	UserPermsAssetAccountsURL = "/api/v1/perms/users/%s/assets/%s/"
 	AccountSecretURL          = "/api/v1/assets/account-secrets/%s/"
 	UserPermsAssetsURL        = "/api/v1/perms/users/%s/assets/"
 
 	AssetLoginConfirmURL = "/api/v1/acls/login-asset/check/"
 	AclCommandReviewURL  = "/api/v1/acls/command-filter-acls/command-review/"
+)
+
+const (
+	UserKoKoPreferenceURL = "/api/v1/users/preference/?category=koko"
+)
+const (
+	FaceMonitorContextUrl = "/api/v1/authentication/face-monitor/context/"
 )

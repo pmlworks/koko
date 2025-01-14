@@ -1,6 +1,8 @@
 package model
 
-import "github.com/jumpserver/koko/pkg/jms-sdk-go/common"
+import (
+	"github.com/jumpserver/koko/pkg/jms-sdk-go/common"
+)
 
 type ConnectToken struct {
 	Id       string     `json:"id"`
@@ -21,8 +23,9 @@ type ConnectToken struct {
 
 	CommandFilterACLs []CommandACL `json:"command_filter_acls"`
 
-	Ticket     *ObjectId   `json:"from_ticket,omitempty"`
-	TicketInfo interface{} `json:"from_ticket_info,omitempty"`
+	Ticket           *ObjectId   `json:"from_ticket,omitempty"`
+	TicketInfo       interface{} `json:"from_ticket_info,omitempty"`
+	FaceMonitorToken string      `json:"face_monitor_token,omitempty"`
 
 	Code   string `json:"code"`
 	Detail string `json:"detail"`
@@ -44,6 +47,8 @@ func (c *ConnectToken) CreateSession(addr string,
 		RemoteAddr: addr,
 		LoginFrom:  loginFrom,
 		Type:       SessionType,
+		ErrReason:  LabelField(SessionReplayErrUnsupported),
+		TokenId:    c.Id,
 	}
 }
 
@@ -64,6 +69,10 @@ type ConnectTokenInfo struct {
 const (
 	ACLReview = "acl_review"
 	ACLReject = "acl_reject"
+
+	ACLFaceVerify             = "acl_face_verify"
+	ACLFaceOnline             = "acl_face_online"
+	ACLFaceOnlineNotSupported = "acl_face_online_not_supported"
 )
 
 type ConnectOptions struct {
@@ -72,4 +81,19 @@ type ConnectOptions struct {
 	BackspaceAsCtrlH *bool   `json:"backspaceAsCtrlH,omitempty"`
 
 	FilenameConflictResolution string `json:"file_name_conflict_resolution,omitempty"`
+	TerminalThemeName          string `json:"terminal_theme_name,omitempty"`
 }
+
+// token 授权和过期状态
+
+type TokenCheckStatus struct {
+	Detail  string `json:"detail"`
+	Code    string `json:"code"`
+	Expired bool   `json:"expired"`
+}
+
+const (
+	CodePermOk             = "perm_ok"
+	CodePermAccountInvalid = "perm_account_invalid"
+	CodePermExpired        = "perm_expired"
+)
